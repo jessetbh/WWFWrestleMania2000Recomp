@@ -102,6 +102,17 @@ RENAME = {
     # provided) and osVirtualToPhysical = osAiSetNextBuffer. All of Revenge's
     # libultra set is now accounted for.
     "func_8002B9C0": "osAiSetNextBuffer",
+    # boot15/17 (menu-transition stall investigation): the game's RECOMPILED thread
+    # teardown ran invisibly against its dead OS structures, so ultramodern never
+    # destroyed host threads and the game then legally reused TCB memory (thread id=6
+    # struct 0x800807F0 overwritten with floats/pointers while its host thread lived).
+    # func_80037890 is osDestroyThread verbatim: __osDisableInt, NULL->__osRunningThread
+    # (D_80048870), state!=1 -> __osDequeueThread(t->queue,t) (func_800324E0), unlink
+    # from __osActiveQueue (D_8004886C) via tlnext (0xC). Naming it routes teardown to
+    # the runtime. (func_80032520 = osYieldThread left unrenamed on purpose: its shim
+    # is a no-op and the recompiled copy already no-ops through stubbed
+    # __osEnqueueAndYield; func_800324E0 = __osDequeueThread becomes dead code.)
+    "func_80037890": "osDestroyThread",
     # NOTE Revenge input invariant: rename ONLY osContInit + __osSiRawStartDma +
     # __osSiDeviceBusy; do NOT rename osContStartReadData (kills the raw-SI path).
 }

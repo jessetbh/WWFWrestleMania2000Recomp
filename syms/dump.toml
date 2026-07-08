@@ -850,7 +850,7 @@ functions = [
     { name = "func_80037760", vram = 0x80037760, size = 0x8C },
     { name = "func_800377F0", vram = 0x800377F0, size = 0x4C },
     { name = "func_80037840", vram = 0x80037840, size = 0x48 },
-    { name = "func_80037890", vram = 0x80037890, size = 0xD8 },
+    { name = "osDestroyThread", vram = 0x80037890, size = 0xD8 },
     { name = "func_80037970", vram = 0x80037970, size = 0x58 },
     { name = "func_800379D0", vram = 0x800379D0, size = 0x44 },
     { name = "func_80037A20", vram = 0x80037A20, size = 0x104 },

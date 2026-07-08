@@ -134,6 +134,312 @@
 +extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr);
  
  #endif
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
++++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-08 09:21:55.053529900 -0400
+@@ -1,5 +1,8 @@
+ #include <cstdio>
+ #include <thread>
++#include <chrono>
++#include <mutex>
++#include <unordered_map>
+ #include <cassert>
+ #include <string>
+ 
+@@ -146,39 +149,175 @@
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
++// [wcw2k] forward declarations (defined below with the context map).
++static UltraThreadContext* wcw2k_get_context(RDRAM_ARG PTR(OSThread) t_);
++static UltraThreadContext* wcw2k_get_context_host(RDRAM_ARG OSThread* t);
++
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+     thread_context->running.wait();
+     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+     // This will trigger thread cleanup instead.
+-    if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
++    // [wcw2k] compare through the repairing accessor so a game-wiped (but live)
++    // context doesn't read as "replaced".
++    if (wcw2k_get_context(PASS_RDRAM ultramodern::this_thread()) != thread_context) {
+         osDestroyThread(PASS_RDRAM NULLPTR);
+     }
+ }
+ 
+-void resume_thread(OSThread* t) {
++void resume_thread(RDRAM_ARG OSThread* t) {
+     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
+-    t->context->running.signal();
++    // [wcw2k] repair a game-wiped context; a thread absent from the host map was
++    // genuinely destroyed — nothing to resume.
++    UltraThreadContext* ctx = wcw2k_get_context_host(PASS_RDRAM t);
++    if (ctx == nullptr) {
++        fprintf(stderr, "[wcw2k][thread] resume of destroyed thread id=%d — skipped\n", t->id);
++        return;
++    }
++    ctx->running.signal();
++}
++
++// [wcw2k] WM2000's main-loop thread wipes its OWN OSThread struct while running (the
++// mode-transition code clears the arena its boot TCB was allocated from, then keeps
++// executing). On hardware that's survivable: the TCB is just memory the OS writes
++// register state into at the next switch. In ultramodern it nulls the host-written
++// `context` pointer, which the runtime needs at every yield. The context pointer is
++// RUNTIME property that merely lives in game memory — so keep an authoritative
++// host-side copy keyed by struct address and transparently restore it when the
++// in-rdram copy reads null. Entries are erased on genuine destruction (osDestroyThread
++// / thread replacement), so a restore can never resurrect a dead thread.
++// The map also keeps priority and id: a wiped TCB leaves garbage priority
++// (observed 0xC4430000 = huge negative), which starves the thread in every
++// priority comparison — it would never finish the mode transition. Restoring the
++// runtime's last-known values mirrors what the scheduler itself knew about the
++// thread; osSetThreadPri keeps the copy in sync.
++struct Wcw2kThreadRecord {
++    UltraThreadContext* context;
++    OSPri priority;
++    OSId id;
++};
++static std::mutex wcw2k_context_map_mutex;
++static std::unordered_map<int32_t, Wcw2kThreadRecord> wcw2k_context_map;
++
++static void wcw2k_register_context(PTR(OSThread) t_, UltraThreadContext* context, OSPri pri, OSId id) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    wcw2k_context_map[(int32_t)t_] = Wcw2kThreadRecord{context, pri, id};
++}
++
++static void wcw2k_update_priority(PTR(OSThread) t_, OSPri pri) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it != wcw2k_context_map.end()) {
++        it->second.priority = pri;
++    }
+ }
+ 
+-void run_next_thread(RDRAM_ARG1) {
+-    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+-        throw std::runtime_error("No threads left to run!\n");
++static void wcw2k_unregister_context(PTR(OSThread) t_, UltraThreadContext* context) {
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it != wcw2k_context_map.end() && it->second.context == context) {
++        wcw2k_context_map.erase(it);
+     }
++}
++
++// Returns the thread's context, repairing a game-wiped in-rdram pointer from the
++// host-side map. Null only if the thread was genuinely destroyed.
++static UltraThreadContext* wcw2k_get_context_host(RDRAM_ARG OSThread* t) {
++    // reverse of TO_PTR: recover the rdram-relative pointer for the map key.
++    PTR(OSThread) t_ = (PTR(OSThread))(int32_t)((uint32_t)((uint8_t*)t - rdram) + 0x80000000u);
++    return wcw2k_get_context(PASS_RDRAM t_);
++}
+ 
+-    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+-    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
+-    to_run->context->running.signal();
++static UltraThreadContext* wcw2k_get_context(RDRAM_ARG PTR(OSThread) t_) {
++    OSThread* t = TO_PTR(OSThread, t_);
++    std::lock_guard lock{wcw2k_context_map_mutex};
++    auto it = wcw2k_context_map.find((int32_t)t_);
++    if (it == wcw2k_context_map.end()) {
++        // No host record (thread not made by osCreateThread, or genuinely destroyed):
++        // the rdram copy is all there is.
++        return t->context;
++    }
++    // The host record is AUTHORITATIVE: the in-rdram copy is just a cache the game
++    // may overwrite with anything (WM2000's transitions wrote zeros one time and
++    // 0x200000012 another). Repair on any mismatch — on hardware libultra likewise
++    // rewrites TCB fields on every context switch, so games cannot keep load-bearing
++    // data in them.
++    if (t->context != it->second.context) {
++        fprintf(stderr, "[wcw2k][thread] repaired clobbered TCB for struct 0x%08X (read id=%d pri=%d ctx=%p; restoring id=%d pri=%d)\n",
++            (uint32_t)t_, t->id, t->priority, (void*)t->context, it->second.id, it->second.priority);
++        t->context = it->second.context;
++        t->priority = it->second.priority;
++        t->id = it->second.id;
++    }
++    return it->second.context;
++}
++
++// [wcw2k] DIAGNOSTIC: dump an OSThread struct's raw words (game-byte-order view) —
++// distinguishes "game clobbered it with unrelated data" from "game manually
++// re-initialized a TCB" (menu-transition crash investigation).
++static void wcw2k_dump_thread_struct(RDRAM_ARG PTR(OSThread) t_) {
++    // rdram stores 32-bit words host-endian at aligned offsets, so a direct u32 view
++    // yields the game's word values.
++    const uint32_t* words = reinterpret_cast<const uint32_t*>(TO_PTR(void, t_));
++    fprintf(stderr, "[wcw2k][thread] struct @0x%08X:", (uint32_t)t_);
++    for (uint32_t i = 0; i < 0x10; i++) {
++        fprintf(stderr, " %08X", words[i]);
++    }
++    fprintf(stderr, "\n");
++}
++
++void run_next_thread(RDRAM_ARG1) {
++    // [wcw2k] Repair game-wiped contexts (see wcw2k_get_context); a queued thread whose
++    // context is null even in the host map was genuinely destroyed — drop it.
++    for (;;) {
++        if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
++            throw std::runtime_error("No threads left to run!\n");
++        }
++
++        PTR(OSThread) to_run_ = ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
++        OSThread* to_run = TO_PTR(OSThread, to_run_);
++        UltraThreadContext* ctx = wcw2k_get_context(PASS_RDRAM to_run_);
++        if (ctx == nullptr) {
++            fprintf(stderr, "[wcw2k][thread] queued thread id=%d (0x%08X) has NULL context and no host record — dropping\n",
++                to_run->id, (uint32_t)to_run_);
++            continue;
++        }
++        debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
++        ctx->running.signal();
++        return;
++    }
+ }
+ 
+ void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
++    // [wcw2k] wcw2k_get_context repairs the in-rdram pointer if the game wiped its own
++    // TCB (WM2000's mode transitions); dump + park only if genuinely destroyed.
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
++    if (cur_context == nullptr) {
++        OSThread* self = TO_PTR(OSThread, thread_self);
++        fprintf(stderr, "[wcw2k][thread] yielding thread id=%d self=0x%08X has NULL context and no host record — parking forever\n",
++            self->id, (uint32_t)thread_self);
++        wcw2k_dump_thread_struct(PASS_RDRAM thread_self);
++        run_next_thread(PASS_RDRAM1);
++        for (;;) {
++            std::this_thread::sleep_for(std::chrono::hours(1));
++        }
++    }
+     run_next_thread(PASS_RDRAM1);
+     wait_for_resumed(PASS_RDRAM cur_context);
+ }
+ 
+ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+-    resume_thread(t);
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
++    resume_thread(PASS_RDRAM t);
++    // [wcw2k] see run_next_thread_and_wait — execution was already handed to t.
++    if (cur_context == nullptr) {
++        OSThread* self = TO_PTR(OSThread, thread_self);
++        fprintf(stderr, "[wcw2k][thread] resuming-and-waiting thread id=%d self=0x%08X has NULL context and no host record — parking forever\n",
++            self->id, (uint32_t)thread_self);
++        wcw2k_dump_thread_struct(PASS_RDRAM thread_self);
++        for (;;) {
++            std::this_thread::sleep_for(std::chrono::hours(1));
++        }
++    }
+     wait_for_resumed(PASS_RDRAM cur_context);
+ }
+ 
+@@ -186,7 +325,7 @@
+     OSThread *self = TO_PTR(OSThread, self_);
+     debug_printf("[Thread] Thread created: %d\n", self->id);
+     // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
+-    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority);
++    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_);
+     thread_self = self_;
+     is_game_thread = true;
+ 
+@@ -220,7 +359,11 @@
+ 
+     // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
+     // so mark this thread as destroyed and run the next queued thread.
+-    if (self->context == thread_context) {
++    // [wcw2k] compare through the repairing accessor (a game-wiped context is still
++    // "ours"), and drop the host-map record — this thread is gone for real.
++    UltraThreadContext* effective_context = wcw2k_get_context(PASS_RDRAM self_);
++    wcw2k_unregister_context(self_, thread_context);
++    if (effective_context == thread_context) {
+         self->context = nullptr;
+         run_next_thread(PASS_RDRAM1);
+     }
+@@ -241,7 +384,7 @@
+     // Otherwise, immediately start the thread and terminate this one.
+     else {
+         t->state = OSThreadState::QUEUED;
+-        resume_thread(t);
++        resume_thread(PASS_RDRAM t);
+         //throw ultramodern::thread_terminated{};
+     }
+ }
+@@ -250,6 +393,13 @@
+     debug_printf("[os] Create Thread %d\n", id);
+     OSThread *t = TO_PTR(OSThread, t_);
+     
++    // [wcw2k] DIAGNOSTIC: struct reuse while a live host thread still references it
++    // (WM2000 recreates threads on the same OSThread structs at menu transitions).
++    if (t->context != nullptr) {
++        fprintf(stderr, "[wcw2k][thread] osCreateThread REUSING struct 0x%08X (old id=%d, ctx alive) for new id=%d entry=0x%08X\n",
++            (uint32_t)t_, t->id, id, (uint32_t)entrypoint);
++    }
++
+     t->next = NULLPTR;
+     t->queue = NULLPTR;
+     t->priority = pri;
+@@ -261,6 +411,7 @@
+     // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
+     UltraThreadContext* context = new UltraThreadContext{};
+     t->context = context;
++    wcw2k_register_context(t_, context, pri, id); // [wcw2k] authoritative host-side copy
+     context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
+ 
+     // Wait until the thread is initialized to indicate that it's ready to be started.
+@@ -286,6 +437,9 @@
+         t_ = thread_self;
+     }
+     OSThread* t = TO_PTR(OSThread, t_);
++    // [wcw2k] DIAGNOSTIC: trace thread churn (menu-transition crash investigation).
++    fprintf(stderr, "[wcw2k][thread] osDestroyThread target=0x%08X id=%d state=%d ctx=%s (self=0x%08X)\n",
++        (uint32_t)t_, t->id, (int)t->state, t->context ? "live" : "null", (uint32_t)thread_self);
+     // Check if the thread is destroying itself (arg is null or thread_self)
+     if (t_ == thread_self) {
+         throw ultramodern::thread_terminated{};
+@@ -295,7 +449,10 @@
+         ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+     }
+     // Check if the thread has already been destroyed to prevent destroying it again.
+-    UltraThreadContext* cur_context = t->context;
++    // [wcw2k] repair a game-wiped pointer first so wiped-then-destroyed threads get
++    // full cleanup, and drop the host-map record — this is genuine destruction.
++    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM t_);
++    wcw2k_unregister_context(t_, cur_context);
+     if (cur_context != nullptr) {
+         // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
+         t->context = nullptr;
+@@ -311,6 +468,7 @@
+ 
+     if (t->priority != pri) {
+         t->priority = pri;
++        wcw2k_update_priority(t_, pri); // [wcw2k] keep the host-side record in sync
+ 
+         if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+             ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-07 15:35:26.737491200 -0400
++++ lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-08 09:37:20.976458400 -0400
+@@ -232,6 +232,10 @@
+         // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
+         while (MQ_IS_FULL(mq)) {
+             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
++            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
++            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X SEND mq=0x%08X\n",
++                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+         }
+@@ -282,6 +286,10 @@
+         // Otherwise, yield this thread in a loop until the queue is no longer full
+         while (MQ_IS_EMPTY(mq)) {
+             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
++            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
++            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X RECV mq=0x%08X\n",
++                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+         }
 --- C:/Users/selki/depot/WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 15:35:30.405515800 -0400
 +++ lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 22:58:34.879467800 -0400
 @@ -160,7 +160,13 @@
