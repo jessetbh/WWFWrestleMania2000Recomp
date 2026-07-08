@@ -1,0 +1,19 @@
+# RSPRecomp config for WM2000's AUDIO microcode.
+# The ucode text is BYTE-IDENTICAL to Revenge's (recon.py 2026-07-07: full 0xC54-byte
+# match at ROM 0x39510; Revenge had it at 0x2C910), so everything in
+# ..\WcwRevengeRecomp\rsp\revenge_audio.toml transfers verbatim — same newer-AKI
+# audio revision (NOT WT's aspMain), same dispatch table (found at ROM 0x4A8F0 here),
+# same 12-bit-PC jump-table gotcha (entry 14 stored as 0x02B0 = recompiler 0x12B0).
+# text_address 0x04001080 = where rspboot places task ucode in IMEM.
+# Run from repo root:  .\RSPRecomp.exe rsp\wm2k_audio.toml  (paths relative to rsp/).
+text_offset = 0x39510
+text_size = 0xC54
+text_address = 0x04001080
+rom_file_path = "../wm2k.z64"
+output_file_path = "wm2k_audio.cpp"
+output_function_name = "wm2k_audio_ucode"
+
+extra_indirect_branch_targets = [
+	0x10EC, 0x139C, 0x119C, 0x1A64, 0x11C8, 0x17EC, 0x1208,
+	0x127C, 0x1348, 0x1248, 0x1C84, 0x12D4, 0x12B0, 0x1384
+]

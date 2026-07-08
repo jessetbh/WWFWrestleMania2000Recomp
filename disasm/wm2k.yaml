@@ -1,0 +1,136 @@
+name: WWF WrestleMania 2000 (USA) (V1.2)
+sha1: d7d1fad473fef9b61fe5f8273c975ee7c603a51b
+options:
+  basename: wm2k
+  target_path: wm2k.z64
+  elf_path: build/wm2k.elf
+  base_path: .
+  platform: n64
+  compiler: IDO
+
+  asm_path: asm
+  data_path: asm/data
+  ld_script_path: wm2k.ld
+  ld_dependencies: True
+
+  find_file_boundaries: True
+  header_encoding: ASCII
+
+  o_as_suffix: True
+  use_legacy_include_asm: False
+  mips_abi_float_regs: o32
+
+  symbol_addrs_path:
+    - symbol_addrs.txt
+  reloc_addrs_path:
+    - reloc_addrs.txt
+
+  undefined_funcs_auto_path: undefined_funcs_auto.txt
+  undefined_syms_auto_path: undefined_syms_auto.txt
+
+  libultra_symbols: True
+  hardware_regs: True
+
+  rodata_string_guesser_level: 2
+  data_string_guesser_level: 2
+
+# Layout (tools/recon.py..recon4.py, 2026-07-07): the AKI swap-overlay architecture
+# again, but with FOUR overlays across TWO swap slots (WT/Revenge had two at one
+# slot). 9-word descriptors (romStart, romEnd, entry, textStart, textEnd, dataStart,
+# dataEnd, bssStart, bssEnd) in a table at rom 0x48A80; text/data/bss bounds below
+# are BYTE-EXACT from those descriptors, not density guesses.
+# Fixed segment rom 0x1000 <-> vram 0x80000400 (same entrypoint as WT/Revenge).
+# CPU code ends 0x39434 (last jr $ra 0x3942C); rspboot at 0x39440, audio ucode text
+# at 0x39510 (byte-identical to Revenge's — see rsp/wm2k_audio.toml), gfx ucode +
+# data + the descriptor table fill out to 0x4C160 where ovl_a begins.
+# Entry stub: clears bss 0x8004B4C0..0x800B1390, jumps to game_main 0x80000460,
+# sp = 0x800961C0.
+segments:
+  - name: header
+    type: header
+    start: 0x0
+
+  - name: ipl3
+    type: bin
+    start: 0x40
+
+  - name: entry
+    type: code
+    start: 0x1000
+    vram: 0x80000400
+    subsegments:
+      - [0x1000, hasm]
+
+  - name: main
+    type: code
+    start: 0x1050
+    vram: 0x80000450
+    follows_vram: entry
+    subsegments:
+      - [0x1050, asm]
+      - [0x39440, data]
+      # late code pocket: 11 j/jal targets from game code land in 0x3C0D0-0x3C628
+      # (found when func_80006668's `j 0x8003B628` tail call failed to recompile);
+      # asm resumes there, last jr $ra at 0x3C620.
+      - [0x3C0D0, asm]
+      - [0x3C628, data]
+
+  # Swap slot 0x800E1B90: ovl_a (menus?) and ovl_d (match engine?) — ovl_d also
+  # overlaps slot 0x8011C900 (it is the big standalone image).
+  - name: ovl_a
+    type: code
+    start: 0x4C160
+    vram: 0x800E1B90
+    exclusive_ram_id: ovl_e1b90
+    bss_size: 0x13B40
+    subsegments:
+      - [0x4C160, asm]
+      - [0x694E0, data]
+      - { type: bss, vram: 0x80108DC0 }
+
+  # Swap slot 0x8011C900: ovl_b (small) and ovl_c (large); either can sit alongside
+  # ovl_a (ovl_a's bss ends exactly at 0x8011C900).
+  - name: ovl_b
+    type: code
+    start: 0x73390
+    vram: 0x8011C900
+    exclusive_ram_id: ovl_11c900
+    bss_size: 0x780
+    subsegments:
+      - [0x73390, asm]
+      - [0x79180, data]
+      - { type: bss, vram: 0x80129F40 }
+
+  - name: ovl_c
+    type: code
+    start: 0x809D0
+    vram: 0x8011C900
+    exclusive_ram_id: ovl_11c900
+    bss_size: 0x3410
+    subsegments:
+      - [0x809D0, asm]
+      - [0xC5530, data]
+      # out-of-line cold-path fragment island inside the "data" range: j/jal
+      # targets from ovl_c text land in vram 0x8016CB5C onward (each fragment
+      # ends with a j back into text); code continues to the end of the data
+      # range (any real data in here disassembles as junk functions that the
+      # recomp loop auto-stubs — none executes).
+      - [0xD0C2C, asm]
+      - { type: bss, vram: 0x8016E650 }
+
+  - name: ovl_d
+    type: code
+    start: 0xD2720
+    vram: 0x800E1B90
+    exclusive_ram_id: ovl_e1b90
+    bss_size: 0x1B260
+    subsegments:
+      - [0xD2720, asm]
+      - [0x13D1D0, data]
+      - { type: bss, vram: 0x80153F10 }
+
+  - name: assets
+    type: bin
+    start: 0x144AA0
+
+  - [0x2000000]
