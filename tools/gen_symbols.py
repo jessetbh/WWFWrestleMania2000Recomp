@@ -82,9 +82,26 @@ RENAME = {
     # of 4 six-word-prefix candidates, the one directly after osSendMesg — matching
     # libultra's source order in Revenge (osSendMesg -> osSetEventMesg).
     "func_80031C10": "osSetEventMesg",
-    # NOT yet identified (revised bodies, no fingerprint transfer — find via the
-    # bring-up crash loop, Revenge's method): osInitialize, osCreatePiManager,
-    # osCartRomInit, osAiSetNextBuffer.
+    # boot1 crash (2026-07-07, PI_STATUS raw read from thread func_800004D0 —
+    # Revenge's 2nd-boot-crash pattern verbatim): the thread calls A380 then A7F0.
+    # A380 ran clean and its effects were logged (pri-150 devmgr thread entry
+    # 0x8002A970 created, osSetEventMesg event=8 OS_EVENT_PI msg=0x22222222) =
+    # osCreatePiManager. A7F0 faulted reading PI_STATUS and its body unpacks
+    # PI_BSD_DOM1_LAT/PGS/RLS/PWD from the ROM-header bus config = osCartRomInit.
+    "func_8002A380": "osCreatePiManager",
+    "func_8002A7F0": "osCartRomInit",
+    # boot2/boot3 crashes: the thread's NEXT call after osCartRomInit. Saves DOM1
+    # timing regs, probes, then READS 0xA6000000 (64DD drive-ROM IPL header) =
+    # osDriveRomInit (librecomp shim exists). First attempt neutered its PI MMIO
+    # with instruction patches (tools/gen_mmio_patches.py) — superseded by this
+    # rename, patches removed.
+    "func_80022540": "osDriveRomInit",
+    # boot8 crash (audio thread func_80026F18 → B9C0 → 37550 raw AI_STATUS read —
+    # Revenge's 7th-iteration pattern verbatim): B9C0 has the even-samples -0x2000
+    # adjust, calls func_80037550 (__osAiDeviceBusy, dead once this is runtime-
+    # provided) and osVirtualToPhysical = osAiSetNextBuffer. All of Revenge's
+    # libultra set is now accounted for.
+    "func_8002B9C0": "osAiSetNextBuffer",
     # NOTE Revenge input invariant: rename ONLY osContInit + __osSiRawStartDma +
     # __osSiDeviceBusy; do NOT rename osContStartReadData (kills the raw-SI path).
 }

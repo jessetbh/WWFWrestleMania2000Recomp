@@ -38,4 +38,19 @@ stubs = [
 ]
 
 ignored = [
+    # not in N64Recomp's built-in auto-ignore set (unlike osCartRomInit), but
+    # librecomp exports osDriveRomInit_recomp — route calls to the shim.
+    "osDriveRomInit",
 ]
+
+# Idle-thread cooperative-yield fix, mirroring wcw.toml/revenge.toml's documented
+# patch: after launching all threads and dropping its own priority to 0, the main
+# thread (func_800004D0) parks in `jal func_80031280; j 0x800005A4` — a busy spin
+# that never yields under ultramodern's cooperative scheduler, starving message
+# delivery (boot9: ext backlog +60/s, del/s=0, vis/s=0). Rewriting the backward j
+# at 0x800005AC into a self-branch (`b .` = 0x1000FFFF) makes N64Recomp emit
+# pause_self(), which drains external messages and yields.
+[[patches.instruction]]
+func = "func_800004D0"
+vram = 0x800005AC
+value = 0x1000FFFF

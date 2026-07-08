@@ -12,6 +12,14 @@
 // patches/syms.ld and is exposed to patches via the generated manual_patch_symbols
 // table — only implement (and list in syms.ld) what patches actually use.
 
+// Bridge for wm2k.toml `ignored` functions that aren't in N64Recomp's built-in
+// auto-ignore set: toml-ignored calls are emitted against the PLAIN name, while
+// librecomp exports only the `_recomp` shim.
+extern "C" void osDriveRomInit_recomp(uint8_t* rdram, recomp_context* ctx);
+extern "C" void osDriveRomInit(uint8_t* rdram, recomp_context* ctx) {
+    osDriveRomInit_recomp(rdram, ctx);
+}
+
 extern "C" void recomp_puts(uint8_t* rdram, recomp_context* ctx) {
     PTR(char) cur_str = _arg<0, PTR(char)>(rdram, ctx);
     u32 length = _arg<1, u32>(rdram, ctx);

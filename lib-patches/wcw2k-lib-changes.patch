@@ -1,0 +1,201 @@
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/overlays.cpp	2026-07-07 18:02:17.318579900 -0400
++++ lib/N64ModernRuntime/librecomp/src/overlays.cpp	2026-07-07 22:32:16.579415900 -0400
+@@ -250,6 +250,77 @@
+     }
+ }
+ 
++// [wcw2k] WM2000 support (see Wm2kRecomp CLAUDE.md; upstream to the jessetbh fork's wcw
++// branch alongside the [wcw fix] set).
++//
++// Boot-resident overlays: WM2000 stores its first two swap-overlays (rom 0x4C160/0x73390)
++// INSIDE the IPL3 1MB boot image and block-copies them to their link addresses with the
++// CPU instead of PI DMA, so the pi.cpp swap hook never sees a load. After the boot-window
++// load, register every section that (a) lies fully inside the boot window, (b) does NOT
++// land at its own address contiguously (those are fixed-segment splits the normal
++// load_overlays call already handled), and (c) doesn't overlap another such candidate
++// (Revenge's two overlays both live in-window at the SAME address — that game DMA-swaps
++// them properly, so they must stay unregistered until the swap hook fires; this filter
++// keeps WT/Revenge behavior byte-identical).
++extern "C" void load_boot_resident_overlays(uint32_t boot_rom, int32_t boot_ram, uint32_t boot_size) {
++    std::vector<size_t> cands;
++    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
++        const SectionTableEntry& s = sections_info.code_sections[i];
++        if (s.rom_addr < boot_rom || s.rom_addr + s.size > boot_rom + boot_size) continue;
++        if ((int32_t)(s.rom_addr - boot_rom) + boot_ram == s.ram_addr) continue;
++        cands.push_back(i);
++    }
++    for (size_t i : cands) {
++        const SectionTableEntry& s = sections_info.code_sections[i];
++        bool conflict = false;
++        for (size_t j : cands) {
++            if (j == i) continue;
++            const SectionTableEntry& o = sections_info.code_sections[j];
++            if (s.ram_addr < o.ram_addr + (int32_t)o.size && o.ram_addr < s.ram_addr + (int32_t)s.size) {
++                conflict = true; break;
++            }
++        }
++        if (conflict) continue;
++        fprintf(stderr, "[wcw][ovl] boot-resident overlay rom=0x%06X registered at 0x%08X\n",
++            s.rom_addr, (uint32_t)s.ram_addr);
++        load_overlay(i, s.ram_addr);
++    }
++}
++
++// [wcw2k] Generalized overlay swap for multi-slot AKI games (WM2000: slots 0x800E1B90 and
++// 0x8011C900, four overlays, one of which spans both slots). If rom_off names a registered
++// code section whose link address equals the DMA destination, swap it in: fully unload
++// every loaded section overlapping the incoming range (unload_overlays' partial-overlap
++// guard is correct for its other callers, but a swap legitimately clobbers a larger
++// resident section), then load. Replaces pi.cpp's hardcoded dest==0x80090000 check;
++// WT/Revenge behavior is unchanged (their swap sections' ram_addr IS 0x80090000).
++extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr) {
++    auto find_it = code_sections_by_rom.find(rom_off);
++    if (find_it == code_sections_by_rom.end()) {
++        return false;
++    }
++    size_t idx = find_it->second;
++    const SectionTableEntry& s = sections_info.code_sections[idx];
++    if (s.ram_addr != ram_addr) {
++        return false;
++    }
++    for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
++        const SectionTableEntry& ls = sections_info.code_sections[it->section_table_index];
++        if (ram_addr < it->loaded_ram_addr + (int32_t)ls.size && it->loaded_ram_addr < ram_addr + (int32_t)s.size) {
++            for (size_t fi = 0; fi < ls.num_funcs; fi++) {
++                func_map.erase(it->loaded_ram_addr + ls.funcs[fi].offset);
++            }
++            section_addresses[ls.index] = ls.ram_addr;
++            it = loaded_sections.erase(it);
++        }
++        else {
++            ++it;
++        }
++    }
++    load_overlay(idx, ram_addr);
++    return true;
++}
++
+ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
+     for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
+         const auto& section = sections_info.code_sections[it->section_table_index];
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/recomp.cpp	2026-07-07 15:35:26.724634500 -0400
++++ lib/N64ModernRuntime/librecomp/src/recomp.cpp	2026-07-07 22:32:19.618456400 -0400
+@@ -498,6 +498,11 @@
+     // Load overlays in the first 1MB
+     load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
+ 
++    // [wcw2k] Register boot-resident swap overlays at their own link addresses (WM2000
++    // block-copies them out of the boot image with the CPU — no DMA to hook). No-op for
++    // WT/Revenge; see overlays.cpp.
++    load_boot_resident_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
++
+     // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
+     recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
+ 
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/pi.cpp	2026-07-07 18:00:32.067189900 -0400
++++ lib/N64ModernRuntime/librecomp/src/pi.cpp	2026-07-07 22:33:30.253183200 -0400
+@@ -298,19 +298,17 @@
+ // unloading the previously-mapped one first. The 0x60000 window bounds section selection
+ // (load_overlays only loads sections fully inside it, and load_overlay uses the section's own
+ // size); it covers either game's largest overlay without reaching the next section.
++// [wcw2k] Generalized: instead of hardcoding the 0x80090000 slot, any DMA whose source rom
++// offset names a registered code section AND whose destination equals that section's link
++// address is treated as an overlay swap (wcw_try_swap_overlay in overlays.cpp fully unloads
++// whatever the incoming section clobbers, then loads it). Handles WM2000's two swap slots
++// (0x800E1B90 / 0x8011C900, four overlays, one spanning both) with identical behavior for
++// WT/Revenge (their swap sections' ram_addr IS 0x80090000).
+ static void wcw_maybe_load_overlay(gpr rdram_address, uint32_t physical_addr) {
+-    if ((uint32_t)rdram_address != 0x80090000) {
+-        return;
+-    }
+     uint32_t rom_off = physical_addr - (uint32_t)recomp::rom_base;
+-    const auto& vrom_map = recomp::overlays::get_vrom_to_section_map();
+-    if (vrom_map.find(rom_off) != vrom_map.end()) {
+-        fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x80090000\n", rom_off);
+-        unload_overlays(0x80090000, 0x00060000); // cover the largest overlay of either game
+-        load_overlays(rom_off, 0x80090000, 0x00060000);
+-        return;
++    if (wcw_try_swap_overlay(rom_off, (int32_t)(uint32_t)rdram_address)) {
++        fprintf(stderr, "[wcw][ovl] map overlay rom=0x%06X -> 0x%08X\n", rom_off, (uint32_t)rdram_address);
+     }
+-    fprintf(stderr, "[wcw][ovl] DMA to 0x80090000 from unrecognized rom 0x%X\n", rom_off);
+ }
+ 
+ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 15:35:26.715112300 -0400
++++ lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 22:33:06.363096500 -0400
+@@ -63,5 +63,9 @@
+ 
+ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
+ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
++// [wcw2k] see overlays.cpp — boot-image-resident overlay registration + generalized
++// multi-slot overlay swap (WM2000).
++extern "C" void load_boot_resident_overlays(uint32_t boot_rom, int32_t boot_ram, uint32_t boot_size);
++extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr);
+ 
+ #endif
+--- C:/Users/selki/depot/WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 15:35:30.405515800 -0400
++++ lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 22:58:34.879467800 -0400
+@@ -160,7 +160,13 @@
+     // 
+     //                  Length      Hash                    Known instances               
+     //     
+-    static std::array<GBISegment, 94> textSegments = {
++    static std::array<GBISegment, 96> textSegments = {
++            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" (AKI 1999): bytes past 0x1000 of the
++            // text are VOLATILE at runtime (hashed differently seconds apart mid-run —
++            // self-modified or yield-state spill), so match on the stable 0x1000-byte
++            // prefix. (The tables are std::sort'ed by length at init, so cumulative
++            // hashing hits the 0x1000 checkpoint first regardless of position here.)
++            GBISegment{ 0x1000,     0x748B4244A299527EULL,  { &F3DLX2_XBUS_2_08_REJ } },
+             GBISegment{ 0x1408,     0x9C0926F5E466BE70ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+             GBISegment{ 0x1400,     0x34EAA6E921BCF1B2ULL,  { &F3D_SDK_F, &F3D_SDK_UNKNOWN_G, &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
+             GBISegment{ 0x1408,     0x3E05E9BBE814C700ULL,  { &F3D_FIFO_SDK_E } }, // Needs confirmation.
+@@ -219,6 +225,11 @@
+             GBISegment{ 0x13A0,     0x0A4F40D3A58CB674ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+             GBISegment{ 0x1198,     0x3B23DFF75831391CULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+             GBISegment{ 0x13A0,     0xA7B96A2FC8C94E60ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            // [wcw2k] WWF WrestleMania 2000's AKI builds (Yasumoto 1999): "F3DEX xbus 2.08"
++            // (3D) and "F3DLX.Rej xbus 2.08" (menus). Text differs from the stock builds,
++            // but the 3D ucode's DATA hashes identically to F3DEX2_XBUS_2_08's 0x420-byte
++            // entry below — same GBI command set for both, per family.
++            GBISegment{ 0x13A0,     0x60BF253FA40991C0ULL,  { &F3DEX2_XBUS_2_08 } },
+             GBISegment{ 0x1198,     0xD5E0AABE069BA75CULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+             GBISegment{ 0x1370,     0xCFCF197526613F82ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+             GBISegment{ 0x1390,     0xDF624201BC21895EULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+@@ -257,7 +268,7 @@
+             GBISegment{ 0x10B0,     0xE8028E4BC6529E6EULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
+     };
+ 
+-    static std::array<GBISegment, 105> dataSegments = {
++    static std::array<GBISegment, 106> dataSegments = {
+             GBISegment{ 0x800,      0xEEB10D73400213B3ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+             GBISegment{ 0x800,      0x49651E384B48F694ULL,  { &F3D_SDK_F } }, // Needs confirmation.
+             GBISegment{ 0x800,      0x1A736198F90E81C5ULL,  { &F3D_SDK_UNKNOWN_G } }, // Needs confirmation.
+@@ -326,6 +337,8 @@
+             GBISegment{ 0x420,      0x1D0B2B02F7C09D84ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+             GBISegment{ 0x410,      0xCE0DAA8259433956ULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x5FB335C8CDF86F48ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" ucode data (see text-segment note).
++            GBISegment{ 0x420,      0xE49057B911FDCAFAULL,  { &F3DLX2_XBUS_2_08_REJ } },
+             GBISegment{ 0x410,      0x2869DC3116DEA560ULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x38FF0FE9D7CFBD34ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+             GBISegment{ 0x420,      0x2E3B70A49807BF89ULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+@@ -438,6 +451,17 @@
+         if (textSegmentIndex < 0 || dataSegmentIndex < 0) {
+             fprintf(stderr, "Unable to find a matching GBI in the current database. This game is not supported in HLE.\n");
+             deduceGBIInformation(RDRAM, textAddress, dataAddress);
++            // [wcw2k] DIAGNOSTIC: print hashes at common segment sizes so an unknown ucode
++            // can be added to the database (WM2000 ships "F3DEX xbus 2.08", an AKI-era
++            // build absent from the tables).
++            for (uint32_t tlen : { 0x1000u, 0x13A0u, 0x1408u }) {
++                fprintf(stderr, "[wcw][gbi] texthash(len=0x%X)=0x%016" PRIX64 "ULL text=0x%X\n",
++                    tlen, XXH3_64bits(&RDRAM[textAddress], tlen), textAddress);
++            }
++            for (uint32_t dlen : { 0x420u, 0x800u }) {
++                fprintf(stderr, "[wcw][gbi] datahash(len=0x%X)=0x%016" PRIX64 "ULL data=0x%X\n",
++                    dlen, XXH3_64bits(&RDRAM[dataAddress], dlen), dataAddress);
++            }
+             return nullptr;
+         }
+ 
