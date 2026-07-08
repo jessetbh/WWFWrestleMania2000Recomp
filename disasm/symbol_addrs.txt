@@ -1,0 +1,1 @@
+func_80038480 = 0x80038480; // type:func size:0x2BC
