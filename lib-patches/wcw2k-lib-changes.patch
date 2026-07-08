@@ -1,4 +1,4 @@
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/overlays.cpp	2026-07-07 18:02:17.318579900 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/overlays.cpp	2026-07-07 18:02:17.318579900 -0400
 +++ lib/N64ModernRuntime/librecomp/src/overlays.cpp	2026-07-07 22:32:16.579415900 -0400
 @@ -250,6 +250,77 @@
      }
@@ -78,7 +78,7 @@
  extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
      for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
          const auto& section = sections_info.code_sections[it->section_table_index];
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/recomp.cpp	2026-07-07 15:35:26.724634500 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/recomp.cpp	2026-07-07 15:35:26.724634500 -0400
 +++ lib/N64ModernRuntime/librecomp/src/recomp.cpp	2026-07-07 22:32:19.618456400 -0400
 @@ -498,6 +498,11 @@
      // Load overlays in the first 1MB
@@ -92,7 +92,7 @@
      // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
      recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
  
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/pi.cpp	2026-07-07 18:00:32.067189900 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/pi.cpp	2026-07-07 18:00:32.067189900 -0400
 +++ lib/N64ModernRuntime/librecomp/src/pi.cpp	2026-07-07 22:33:30.253183200 -0400
 @@ -298,19 +298,17 @@
  // unloading the previously-mapped one first. The 0x60000 window bounds section selection
@@ -122,7 +122,7 @@
  }
  
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 15:35:26.715112300 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 15:35:26.715112300 -0400
 +++ lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 22:33:06.363096500 -0400
 @@ -63,5 +63,9 @@
  
@@ -134,8 +134,8 @@
 +extern "C" bool wcw_try_swap_overlay(uint32_t rom_off, int32_t ram_addr);
  
  #endif
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
-+++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-08 09:21:55.053529900 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
++++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-08 19:24:31.513724400 -0400
 @@ -1,5 +1,8 @@
  #include <cstdio>
  #include <thread>
@@ -145,7 +145,7 @@
  #include <cassert>
  #include <string>
  
-@@ -146,39 +149,175 @@
+@@ -146,39 +149,210 @@
  void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
  #endif
  
@@ -260,6 +260,18 @@
 +    return it->second.context;
 +}
 +
++// [wcw2k] public wrapper so the scheduler (scheduling.cpp) can repair a wiped TCB
++// before its raw priority reads: check_running_queue's compare and
++// thread_queue_insert's ordering both read t->priority straight from rdram, and a
++// game-wiped garbage priority there mis-sorts the thread PERMANENTLY (a hugely
++// negative value inserts it behind the pri-8 idle thread, whose pause_self loop only
++// ever swaps to strictly-higher-priority queued threads — the thread is then never
++// popped, so the pop-time repair never fires; observed as the post-transition wedge:
++// thread 6 starved forever, gfx frozen, audio alive).
++UltraThreadContext* ultramodern::wcw2k_repair_thread(RDRAM_ARG PTR(OSThread) t_) {
++    return wcw2k_get_context(PASS_RDRAM t_);
++}
++
 +// [wcw2k] DIAGNOSTIC: dump an OSThread struct's raw words (game-byte-order view) —
 +// distinguishes "game clobbered it with unrelated data" from "game manually
 +// re-initialized a TCB" (menu-transition crash investigation).
@@ -274,9 +286,32 @@
 +    fprintf(stderr, "\n");
 +}
 +
++// [wcw2k] WCW_SCHED_LOG=1: periodic one-line dump of the running queue (id/pri/struct
++// chain) so a starved thread is visible — a wedge shows up as a thread sitting in the
++// queue with wrong priority (or missing entirely) while others cycle.
++static void wcw2k_sched_log(RDRAM_ARG1) {
++    static const bool enabled = getenv("WCW_SCHED_LOG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    static uint32_t pop_count = 0;
++    if ((pop_count++ % 512) != 0) {
++        return;
++    }
++    fprintf(stderr, "[wcw2k][sched] self=0x%08X queue:", (uint32_t)ultramodern::this_thread());
++    PTR(OSThread) cur = ultramodern::thread_queue_peek(PASS_RDRAM ultramodern::running_queue);
++    for (int i = 0; cur != NULLPTR && i < 16; i++) {
++        OSThread* t = TO_PTR(OSThread, cur);
++        fprintf(stderr, " id=%d pri=%d @0x%08X", t->id, t->priority, (uint32_t)cur);
++        cur = t->next;
++    }
++    fprintf(stderr, "\n");
++}
++
 +void run_next_thread(RDRAM_ARG1) {
 +    // [wcw2k] Repair game-wiped contexts (see wcw2k_get_context); a queued thread whose
 +    // context is null even in the host map was genuinely destroyed — drop it.
++    wcw2k_sched_log(PASS_RDRAM1);
 +    for (;;) {
 +        if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
 +            throw std::runtime_error("No threads left to run!\n");
@@ -333,7 +368,7 @@
      wait_for_resumed(PASS_RDRAM cur_context);
  }
  
-@@ -186,7 +325,7 @@
+@@ -186,7 +360,7 @@
      OSThread *self = TO_PTR(OSThread, self_);
      debug_printf("[Thread] Thread created: %d\n", self->id);
      // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
@@ -342,7 +377,7 @@
      thread_self = self_;
      is_game_thread = true;
  
-@@ -220,7 +359,11 @@
+@@ -220,7 +394,11 @@
  
      // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
      // so mark this thread as destroyed and run the next queued thread.
@@ -355,7 +390,7 @@
          self->context = nullptr;
          run_next_thread(PASS_RDRAM1);
      }
-@@ -241,7 +384,7 @@
+@@ -241,7 +419,7 @@
      // Otherwise, immediately start the thread and terminate this one.
      else {
          t->state = OSThreadState::QUEUED;
@@ -364,7 +399,7 @@
          //throw ultramodern::thread_terminated{};
      }
  }
-@@ -250,6 +393,13 @@
+@@ -250,6 +428,13 @@
      debug_printf("[os] Create Thread %d\n", id);
      OSThread *t = TO_PTR(OSThread, t_);
      
@@ -378,7 +413,7 @@
      t->next = NULLPTR;
      t->queue = NULLPTR;
      t->priority = pri;
-@@ -261,6 +411,7 @@
+@@ -261,6 +446,7 @@
      // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
      UltraThreadContext* context = new UltraThreadContext{};
      t->context = context;
@@ -386,7 +421,7 @@
      context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
  
      // Wait until the thread is initialized to indicate that it's ready to be started.
-@@ -286,6 +437,9 @@
+@@ -286,6 +472,9 @@
          t_ = thread_self;
      }
      OSThread* t = TO_PTR(OSThread, t_);
@@ -396,7 +431,7 @@
      // Check if the thread is destroying itself (arg is null or thread_self)
      if (t_ == thread_self) {
          throw ultramodern::thread_terminated{};
-@@ -295,7 +449,10 @@
+@@ -295,7 +484,10 @@
          ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
      }
      // Check if the thread has already been destroyed to prevent destroying it again.
@@ -408,7 +443,7 @@
      if (cur_context != nullptr) {
          // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
          t->context = nullptr;
-@@ -311,6 +468,7 @@
+@@ -311,6 +503,7 @@
  
      if (t->priority != pri) {
          t->priority = pri;
@@ -416,7 +451,43 @@
  
          if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
              ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-07 15:35:26.737491200 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/scheduling.cpp	2026-07-07 15:35:26.738994100 -0400
++++ lib/N64ModernRuntime/ultramodern/src/scheduling.cpp	2026-07-08 19:24:31.515725700 -0400
+@@ -2,6 +2,10 @@
+ 
+ void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
+     debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
++    // [wcw2k] thread_queue_insert orders by a raw rdram read of t->priority; repair a
++    // game-wiped TCB first or garbage priority mis-sorts the thread permanently
++    // (the post-transition wedge — see wcw2k_repair_thread in threads.cpp).
++    ultramodern::wcw2k_repair_thread(PASS_RDRAM t_);
+     thread_queue_insert(PASS_RDRAM running_queue, t_);
+     TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
+ }
+@@ -9,6 +13,8 @@
+ void swap_to_thread(RDRAM_ARG OSThread *to) {
+     debug_printf("[Scheduling] Thread %d giving execution to thread %d\n", TO_PTR(OSThread, ultramodern::this_thread())->id, to->id);
+     // Insert this thread in the running queue.
++    // [wcw2k] repair self before the priority-ordered insert (see schedule_running_thread).
++    ultramodern::wcw2k_repair_thread(PASS_RDRAM ultramodern::this_thread());
+     ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
+     TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+     // Unpause the target thread and wait for this one to be unpaused.
+@@ -19,7 +25,12 @@
+     // Check if there are any threads in the running queue.
+     if (!thread_queue_empty(PASS_RDRAM running_queue)) {
+         // Check if the highest priority thread in the queue is higher priority than the current thread.
+-        OSThread* next_thread = TO_PTR(OSThread, ultramodern::thread_queue_peek(PASS_RDRAM running_queue));
++        // [wcw2k] repair both TCBs before the raw priority compare — a wiped garbage
++        // priority on either side yields a wrong (and sticky) scheduling decision.
++        PTR(OSThread) next_thread_ = ultramodern::thread_queue_peek(PASS_RDRAM running_queue);
++        ultramodern::wcw2k_repair_thread(PASS_RDRAM next_thread_);
++        ultramodern::wcw2k_repair_thread(PASS_RDRAM ultramodern::this_thread());
++        OSThread* next_thread = TO_PTR(OSThread, next_thread_);
+         OSThread* self = TO_PTR(OSThread, ultramodern::this_thread());
+         if (next_thread->priority > self->priority) {
+             ultramodern::thread_queue_pop(PASS_RDRAM running_queue);
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-07 15:35:26.737491200 -0400
 +++ lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-08 09:37:20.976458400 -0400
 @@ -232,6 +232,10 @@
          // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
@@ -440,7 +511,19 @@
              ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
              ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
          }
---- C:/Users/selki/depot/WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 15:35:30.405515800 -0400
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-07 15:35:26.735491600 -0400
++++ lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-08 19:24:31.516725700 -0400
+@@ -57,6 +57,9 @@
+ void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
+ 
+ // Thread scheduling.
++// [wcw2k] repair a game-wiped TCB (context/pri/id) from the authoritative host-side
++// record before any raw rdram read of its fields; see threads.cpp.
++UltraThreadContext* wcw2k_repair_thread(RDRAM_ARG PTR(OSThread) t);
+ void check_running_queue(RDRAM_ARG1);
+ void run_next_thread_and_wait(RDRAM_ARG1);
+ void resume_thread_and_wait(RDRAM_ARG OSThread* t);
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 15:35:30.405515800 -0400
 +++ lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 22:58:34.879467800 -0400
 @@ -160,7 +160,13 @@
      // 
