@@ -40,6 +40,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <timeapi.h>
+#pragma comment(lib, "winmm.lib") // timeBeginPeriod
 #include <io.h>
 #include <fcntl.h>
 #include <dxgi1_4.h>
@@ -498,6 +499,13 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     std::set_terminate(wcw_terminate_handler);
     SetUnhandledExceptionFilter(wcw_unhandled_filter);
+
+    // [wcw] ultramodern paces VI/timer events with raw Sleep() (timer.cpp), whose
+    // granularity is the PER-PROCESS timer resolution on Win10 2004+/Win11. Nothing
+    // in-process holds 1ms otherwise, so retrace delivery can quantize to 15.6ms and
+    // burst — the >=pri-80 event relay then never drains and starves the game loop
+    // (frozen video, live audio, from boot). Hold 1ms for the process lifetime.
+    timeBeginPeriod(1);
 
     // [wcw] DIAGNOSTIC: when running under RenderDoc (renderdoc.dll injected), trigger a
     // one-frame capture ~8s in (title screen rendering steadily by then). The capture is the
