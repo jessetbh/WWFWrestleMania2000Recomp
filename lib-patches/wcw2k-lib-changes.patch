@@ -291,8 +291,8 @@
  
  #endif
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
-+++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-08 23:15:08.482117200 -0400
-@@ -1,369 +1,639 @@
++++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-11 23:10:37.969812100 -0400
+@@ -1,369 +1,707 @@
 -#include <cstdio>
 -#include <thread>
 -#include <cassert>
@@ -905,7 +905,14 @@
 +    // 0x200000012 another). Repair on any mismatch — on hardware libultra likewise
 +    // rewrites TCB fields on every context switch, so games cannot keep load-bearing
 +    // data in them.
-+    if (t->context != it->second.context) {
++    // Compare ALL mirrored fields, not context alone: boot47's wedge was a wipe flavor
++    // that trashed only the first 0x10 TCB bytes (priority=-1, queue=-1, next=0) while
++    // leaving the +0x20 context intact — a context-only trigger no-ops, and the pri -1
++    // thread then loses every check_running_queue compare from the HEAD of the running
++    // queue (which the starvation valve exempted) and parks forever. Priority is safe
++    // to compare: osSetThreadPri keeps the record in sync, so any divergence is a
++    // clobber.
++    if (t->context != it->second.context || t->priority != it->second.priority || t->id != it->second.id) {
 +        fprintf(stderr, "[wcw2k][thread] repaired clobbered TCB for struct 0x%08X (read id=%d pri=%d ctx=%p; restoring id=%d pri=%d)\n",
 +            (uint32_t)t_, t->id, t->priority, (void*)t->context, it->second.id, it->second.priority);
 +        t->context = it->second.context;
@@ -923,7 +930,10 @@
 +// ever swaps to strictly-higher-priority queued threads — the thread is then never
 +// popped, so the pop-time repair never fires; observed as the post-transition wedge:
 +// thread 6 starved forever, gfx frozen, audio alive).
++static void wcw2k_spraywatch(RDRAM_ARG const char* where);
++
 +UltraThreadContext* ultramodern::wcw2k_repair_thread(RDRAM_ARG PTR(OSThread) t_) {
++    wcw2k_spraywatch(PASS_RDRAM "sched");
 +    return wcw2k_get_context(PASS_RDRAM t_);
 +}
 +
@@ -975,8 +985,26 @@
 +        return NULLPTR;
 +    }
 +    std::lock_guard lock{wcw2k_queued_since_mutex};
-+    // Never override in favor of the head itself (the normal pop handles it), and
-+    // leave priority-0 idle threads alone (starving idle is by design).
++    // Leave priority-0 idle threads alone (starving idle is by design). The head used
++    // to be exempt ("the normal pop handles it") — but boot47 proved a clobbered head
++    // can sit unpoppable forever: TCB wiped to priority=-1 with context intact, so the
++    // context-only repair no-op'd and check_running_queue never saw it outrank idle.
++    // The field-mismatch repair now fixes that flavor at peek time; popping an overdue
++    // head here as well covers any future flavor the repair can't recognize (e.g. no
++    // host record). Healthy scheduling never leaves the head queued 50ms, so this
++    // changes nothing on the happy path.
++    {
++        OSThread* h = TO_PTR(OSThread, head);
++        auto hit = wcw2k_queued_since.find((int32_t)head);
++        if (h->priority != 0 && hit != wcw2k_queued_since.end() && now - hit->second > WCW2K_STARVATION_MS) {
++            ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
++            wcw2k_boosted_thread.store((int32_t)head, std::memory_order_relaxed);
++            wcw2k_boost_until.store(now + WCW2K_BOOST_MS, std::memory_order_relaxed);
++            fprintf(stderr, "[wcw2k][sched] STARVATION valve (HEAD): thread id=%d pri=%d @0x%08X queued %lld ms unpopped; boosting %lld ms\n",
++                h->id, h->priority, (uint32_t)head, (long long)(now - hit->second), (long long)WCW2K_BOOST_MS);
++            return head;
++        }
++    }
 +    PTR(OSThread) prev = head;
 +    PTR(OSThread) cur = TO_PTR(OSThread, head)->next;
 +    while (cur != NULLPTR) {
@@ -1036,7 +1064,44 @@
 +    fprintf(stderr, "\n");
 +}
 +
++// [wcw2k] DIAGNOSTIC (WCW2K_SPRAYWATCH=1): watch the region holding WM2000's thread-6
++// TCB + stack (0x80080000..0x80084000) for writes, attributed to the game thread that
++// just ran (checked at every scheduler touch). WM2000's transitions spray this region
++// (evolving garbage across 7 TCB repairs in boot48) and thread 6 resumes with a saved
++// register restored from a clobbered stack slot (s0=1 -> crash in func_800222D8).
++// Changes while thread 6 itself runs are its own stack traffic and are not logged.
++static void wcw2k_spraywatch(RDRAM_ARG const char* where) {
++    static const bool enabled = getenv("WCW2K_SPRAYWATCH") != nullptr;
++    if (!enabled) return;
++    constexpr uint32_t base = 0x80080000, size = 0x4000, line = 64;
++    static uint8_t prev[size];
++    static bool primed = false;
++    const uint8_t* cur = (const uint8_t*)TO_PTR(void, (int32_t)base);
++    if (!primed) { memcpy(prev, cur, size); primed = true; return; }
++    PTR(OSThread) self_ = ultramodern::this_thread();
++    // Thread 6 struct = 0x800807F0: its own runs legitimately write its stack.
++    if ((uint32_t)self_ == 0x800807F0u) { memcpy(prev, cur, size); return; }
++    int shown = 0; uint32_t changed = 0;
++    for (uint32_t off = 0; off < size; off += line) {
++        if (memcmp(prev + off, cur + off, line) != 0) {
++            changed++;
++            if (shown < 4) {
++                const uint32_t* w = (const uint32_t*)(cur + off);
++                fprintf(stderr, "[wcw2k][spray] 0x%08X: %08X %08X %08X %08X (by struct=0x%08X id=%d at %s)\n",
++                    base + off, w[0], w[1], w[2], w[3], (uint32_t)self_,
++                    self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
++                shown++;
++            }
++        }
++    }
++    if (changed > 4) {
++        fprintf(stderr, "[wcw2k][spray] ... %u lines changed total (by struct=0x%08X)\n", changed, (uint32_t)self_);
++    }
++    if (changed) { memcpy(prev, cur, size); }
++}
++
 +void run_next_thread(RDRAM_ARG1) {
++    wcw2k_spraywatch(PASS_RDRAM "pop");
 +    // [wcw2k] Repair game-wiped contexts (see wcw2k_get_context); a queued thread whose
 +    // context is null even in the host map was genuinely destroyed — drop it.
 +    wcw2k_sched_log(PASS_RDRAM1);
@@ -1101,7 +1166,10 @@
 +    OSThread *self = TO_PTR(OSThread, self_);
 +    debug_printf("[Thread] Thread created: %d\n", self->id);
 +    // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
-+    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_);
++    // [wcw2k] + stack pointer: to check whether a thread's stack lies inside the region
++    // WM2000's transitions spray (boot48 crash: thread 6 resumed with a saved reg
++    // restored as garbage from a stack slot).
++    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X sp=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_, (uint32_t)self->sp);
 +    thread_self = self_;
 +    is_game_thread = true;
 +
