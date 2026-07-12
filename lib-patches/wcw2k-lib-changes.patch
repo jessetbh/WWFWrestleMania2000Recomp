@@ -122,6 +122,22 @@
  }
  
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-07 15:35:26.717619900 -0400
++++ lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-11 22:09:04.367521000 -0400
+@@ -28,5 +28,12 @@
+ }
+ 
+ extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    ctx->r2 = 0x00000000; // Pretend the audio DMAs finish instantly
++    // [wcw2k] Report AI_STATUS_FULL|AI_STATUS_DMA_BUSY while the host queue is backlogged
++    // so the game's own FULL-wait loop paces generation (it blocks on its frame message, so
++    // this never spins). Previously hardcoded 0 ("DMAs finish instantly"), which disabled
++    // WM2000's only audio throttle.
++    bool full = ultramodern::is_audio_backlogged();
++    ctx->r2 = full ? 0xC0000000 : 0x00000000;
++    { static int n = 0, fulls = 0; if (full) fulls++;
++      if ((n++ % 4096) == 0) fprintf(stderr, "[wcw][ai] osAiGetStatus #%d fulls=%d\n", n - 1, fulls); }
+ }
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 15:35:26.715112300 -0400
 +++ lib/N64ModernRuntime/librecomp/include/librecomp/overlays.hpp	2026-07-07 22:33:06.363096500 -0400
 @@ -63,5 +63,9 @@
@@ -136,39 +152,544 @@
  #endif
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
 +++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-08 23:15:08.482117200 -0400
-@@ -1,5 +1,8 @@
- #include <cstdio>
- #include <thread>
+@@ -1,369 +1,639 @@
+-#include <cstdio>
+-#include <thread>
+-#include <cassert>
+-#include <string>
+-
+-#include "ultramodern/ultra64.h"
+-#include "ultramodern/ultramodern.hpp"
+-#include "blockingconcurrentqueue.h"
+-
+-#include "ultramodern/threads.hpp"
+-
+-// Native APIs only used to set thread names for easier debugging
+-#ifdef _WIN32
+-#include <Windows.h>
+-#endif
+-
+-static ultramodern::threads::callbacks_t threads_callbacks;
+-
+-void ultramodern::threads::set_callbacks(const callbacks_t& callbacks) {
+-    threads_callbacks = callbacks;
+-}
+-
+-std::string ultramodern::threads::get_game_thread_name(const OSThread* t) {
+-    if (threads_callbacks.get_game_thread_name == nullptr) {
+-        return "Game Thread " + std::to_string(t->id);
+-    }
+-    return threads_callbacks.get_game_thread_name(t);
+-}
+-
+-extern "C" void bootproc();
+-
+-thread_local bool is_main_thread = false;
+-// Whether this thread is part of the game (i.e. the start thread or one spawned by osCreateThread)
+-thread_local bool is_game_thread = false;
+-thread_local PTR(OSThread) thread_self = NULLPTR;
+-
+-void ultramodern::set_main_thread() {
+-    ::is_game_thread = true;
+-    is_main_thread = true;
+-}
+-
+-bool ultramodern::is_game_thread() {
+-    return ::is_game_thread;
+-}
+-
+-#if 0
+-int main(int argc, char** argv) {
+-    ultramodern::set_main_thread();
+-
+-    bootproc();
+-}
+-#endif
+-
+-#if 1
+-void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg);
+-#else
+-#define run_thread_function(func, sp, arg) func(arg)
+-#endif
+-
+-#if defined(_WIN32)
+-void ultramodern::set_native_thread_name(const std::string& name) {
+-    std::wstring wname{name.begin(), name.end()};
+-
+-    HRESULT r;
+-    r = SetThreadDescription(
+-        GetCurrentThread(),
+-        wname.c_str()
+-    );
+-}
+-
+-void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+-    int nPriority = THREAD_PRIORITY_NORMAL;
+-
+-    // Convert ThreadPriority to Win32 priority
+-    switch (pri) {
+-        case ThreadPriority::Low:
+-            nPriority = THREAD_PRIORITY_BELOW_NORMAL;
+-            break;
+-        case ThreadPriority::Normal:
+-            nPriority = THREAD_PRIORITY_NORMAL;
+-            break;
+-        case ThreadPriority::High:
+-            nPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+-            break;
+-        case ThreadPriority::VeryHigh:
+-            nPriority = THREAD_PRIORITY_HIGHEST;
+-            break;
+-        case ThreadPriority::Critical:
+-            nPriority = THREAD_PRIORITY_TIME_CRITICAL;
+-            break;
+-        default:
+-            throw std::runtime_error("Invalid thread priority!");
+-            break;
+-    }
+-    // SetThreadPriority(GetCurrentThread(), nPriority);
+-}
+-#elif defined(__linux__)
+-#include <sys/prctl.h>
+-
+-void ultramodern::set_native_thread_name(const std::string& name) {
+-    if (name.length() > 15) {
+-        // Linux only accepts up to 16 characters including the null terminator for a thread name.
+-        debug_printf("[Thread] The thread name '%s' will be truncated to 15 characters", name.c_str());
+-    }
+-
+-    prctl(PR_SET_NAME, name.c_str());
+-}
+-
+-void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+-    // TODO linux thread priority
+-    // printf("set_native_thread_priority unimplemented\n");
+-    // int nPriority = THREAD_PRIORITY_NORMAL;
+-
+-    // // Convert ThreadPriority to Win32 priority
+-    // switch (pri) {
+-    //     case ThreadPriority::Low:
+-    //         nPriority = THREAD_PRIORITY_BELOW_NORMAL;
+-    //         break;
+-    //     case ThreadPriority::Normal:
+-    //         nPriority = THREAD_PRIORITY_NORMAL;
+-    //         break;
+-    //     case ThreadPriority::High:
+-    //         nPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+-    //         break;
+-    //     case ThreadPriority::VeryHigh:
+-    //         nPriority = THREAD_PRIORITY_HIGHEST;
+-    //         break;
+-    //     case ThreadPriority::Critical:
+-    //         nPriority = THREAD_PRIORITY_TIME_CRITICAL;
+-    //         break;
+-    //     default:
+-    //         throw std::runtime_error("Invalid thread priority!");
+-    //         break;
+-    // }
+-}
+-#elif defined(__APPLE__)
+-void ultramodern::set_native_thread_name(const std::string& name) {
+-    if (name.length() > 15) {
+-        // Macs seem to only accept up to 16 characters including the null terminator for a thread name.
+-        debug_printf("[Thread] The thread name '%s' will be truncated to 15 characters", name.c_str());
+-    }
+-
+-    pthread_setname_np(name.c_str());
+-}
+-
+-void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+-#endif
+-
+-void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+-    thread_context->running.wait();
+-    // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+-    // This will trigger thread cleanup instead.
+-    if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
+-        osDestroyThread(PASS_RDRAM NULLPTR);
+-    }
+-}
+-
+-void resume_thread(OSThread* t) {
+-    debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
+-    t->context->running.signal();
+-}
+-
+-void run_next_thread(RDRAM_ARG1) {
+-    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+-        throw std::runtime_error("No threads left to run!\n");
+-    }
+-
+-    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+-    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
+-    to_run->context->running.signal();
+-}
+-
+-void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+-    run_next_thread(PASS_RDRAM1);
+-    wait_for_resumed(PASS_RDRAM cur_context);
+-}
+-
+-void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
+-    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+-    resume_thread(t);
+-    wait_for_resumed(PASS_RDRAM cur_context);
+-}
+-
+-static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
+-    OSThread *self = TO_PTR(OSThread, self_);
+-    debug_printf("[Thread] Thread created: %d\n", self->id);
+-    // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
+-    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority);
+-    thread_self = self_;
+-    is_game_thread = true;
+-
+-    // Set the thread name
+-    ultramodern::set_native_thread_name(ultramodern::threads::get_game_thread_name(self));
+-    ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
+-
+-    // Signal the initialized semaphore to indicate that this thread can be started.
+-    thread_context->initialized.signal();
+-
+-    debug_printf("[Thread] Thread waiting to be started: %d\n", self->id);
+-
+-    // Wait until the thread is marked as running.
+-    try {
+-        wait_for_resumed(PASS_RDRAM thread_context);
+-    } catch (ultramodern::thread_terminated& terminated) {
+-    }
+-
+-    // Make sure the thread wasn't replaced or destroyed before it was started.
+-    if (self->context == thread_context) {
+-        debug_printf("[Thread] Thread started: %d\n", self->id);
+-        try {
+-            // Run the thread's function with the provided argument.
+-            run_thread_function(PASS_RDRAM entrypoint, self->sp, arg);
+-        } catch (ultramodern::thread_terminated& terminated) {
+-        }
+-    }
+-    else {
+-        debug_printf("[Thread] Thread destroyed before being started: %d\n", self->id);
+-    }
+-
+-    // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
+-    // so mark this thread as destroyed and run the next queued thread.
+-    if (self->context == thread_context) {
+-        self->context = nullptr;
+-        run_next_thread(PASS_RDRAM1);
+-    }
+-
+-    // Dispose of this thread now that it's completed or terminated.
+-    ultramodern::cleanup_thread(thread_context);
+-}
+-
+-extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
+-    OSThread* t = TO_PTR(OSThread, t_);
+-    debug_printf("[os] Start Thread %d\n", t->id);
+-
+-    // If this is a game thread, insert the new thread into the running queue and then check the running queue.
+-    if (thread_self) {
+-        ultramodern::schedule_running_thread(PASS_RDRAM t_);
+-        ultramodern::check_running_queue(PASS_RDRAM1);
+-    }
+-    // Otherwise, immediately start the thread and terminate this one.
+-    else {
+-        t->state = OSThreadState::QUEUED;
+-        resume_thread(t);
+-        //throw ultramodern::thread_terminated{};
+-    }
+-}
+-
+-extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_func_t) entrypoint, PTR(void) arg, PTR(void) sp, OSPri pri) {
+-    debug_printf("[os] Create Thread %d\n", id);
+-    OSThread *t = TO_PTR(OSThread, t_);
+-    
+-    t->next = NULLPTR;
+-    t->queue = NULLPTR;
+-    t->priority = pri;
+-    t->id = id;
+-    t->state = OSThreadState::STOPPED;
+-    t->sp = sp - 0x10; // Set up the first stack frame
+-
+-    // Spawn a new thread, which will immediately pause itself and wait until it's been started.
+-    // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
+-    UltraThreadContext* context = new UltraThreadContext{};
+-    t->context = context;
+-    context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
+-
+-    // Wait until the thread is initialized to indicate that it's ready to be started.
+-    context->initialized.wait();
+-    debug_printf("[os] Thread %d is ready to be started\n", t->id);
+-}
+-
+-extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
+-    if (t_ == NULLPTR) {
+-        t_ = thread_self;
+-    }
+-    // Check if the thread is stopping itself (arg is null or thread_self).
+-    if (t_ == thread_self) {
+-        ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+-    }
+-    else {
+-        assert(false);
+-    }
+-}
+-
+-extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+-    if (t_ == NULLPTR) {
+-        t_ = thread_self;
+-    }
+-    OSThread* t = TO_PTR(OSThread, t_);
+-    // Check if the thread is destroying itself (arg is null or thread_self)
+-    if (t_ == thread_self) {
+-        throw ultramodern::thread_terminated{};
+-    }
+-    // Otherwise if the thread isn't stopped, remove it from its currrent queue., 
+-    if (t->state != OSThreadState::STOPPED) {
+-        ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+-    }
+-    // Check if the thread has already been destroyed to prevent destroying it again.
+-    UltraThreadContext* cur_context = t->context;
+-    if (cur_context != nullptr) {
+-        // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
+-        t->context = nullptr;
+-        cur_context->running.signal();
+-    }
+-}
+-
+-extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+-    if (t_ == NULLPTR) {
+-        t_ = thread_self;
+-    }
+-    OSThread* t = TO_PTR(OSThread, t_);
+-
+-    if (t->priority != pri) {
+-        t->priority = pri;
+-
+-        if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+-            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+-            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
+-        }
+-
+-        ultramodern::check_running_queue(PASS_RDRAM1);
+-    }
+-}
+-
+-extern "C" OSPri osGetThreadPri(RDRAM_ARG PTR(OSThread) t) {
+-    if (t == NULLPTR) {
+-        t = thread_self;
+-    }
+-    return TO_PTR(OSThread, t)->priority;
+-}
+-
+-extern "C" OSId osGetThreadId(RDRAM_ARG PTR(OSThread) t) {
+-    if (t == NULLPTR) {
+-        t = thread_self;
+-    }
+-    return TO_PTR(OSThread, t)->id;
+-}
+-
+-PTR(OSThread) ultramodern::this_thread() {
+-    return thread_self;
+-}
+-
+-static std::thread thread_cleaner_thread;
+-static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{};
+-extern std::atomic_bool exited;
+-
+-void thread_cleaner_func() {
+-    using namespace std::chrono_literals;
+-    while (!exited) {
+-        UltraThreadContext* to_delete;
+-        if (deleted_threads.wait_dequeue_timed(to_delete, 10ms)) {
+-            debug_printf("[Cleanup] Deleting thread context %p\n", to_delete);
+-
+-            to_delete->host_thread.join();
+-            delete to_delete;
+-        }
+-    }
+-}
+-
+-void ultramodern::init_thread_cleanup() {
+-    thread_cleaner_thread = std::thread{thread_cleaner_func};
+-}
+-
+-void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
+-    deleted_threads.enqueue(cur_context);
+-}
+-
+-void ultramodern::join_thread_cleaner_thread() {
+-    thread_cleaner_thread.join();
+-}
++#include <cstdio>
++#include <thread>
 +#include <chrono>
 +#include <mutex>
 +#include <unordered_map>
- #include <cassert>
- #include <string>
- 
-@@ -146,39 +149,287 @@
- void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
- #endif
- 
++#include <cassert>
++#include <string>
++
++#include "ultramodern/ultra64.h"
++#include "ultramodern/ultramodern.hpp"
++#include "blockingconcurrentqueue.h"
++
++#include "ultramodern/threads.hpp"
++
++// Native APIs only used to set thread names for easier debugging
++#ifdef _WIN32
++#include <Windows.h>
++#endif
++
++static ultramodern::threads::callbacks_t threads_callbacks;
++
++void ultramodern::threads::set_callbacks(const callbacks_t& callbacks) {
++    threads_callbacks = callbacks;
++}
++
++std::string ultramodern::threads::get_game_thread_name(const OSThread* t) {
++    if (threads_callbacks.get_game_thread_name == nullptr) {
++        return "Game Thread " + std::to_string(t->id);
++    }
++    return threads_callbacks.get_game_thread_name(t);
++}
++
++extern "C" void bootproc();
++
++thread_local bool is_main_thread = false;
++// Whether this thread is part of the game (i.e. the start thread or one spawned by osCreateThread)
++thread_local bool is_game_thread = false;
++thread_local PTR(OSThread) thread_self = NULLPTR;
++
++void ultramodern::set_main_thread() {
++    ::is_game_thread = true;
++    is_main_thread = true;
++}
++
++bool ultramodern::is_game_thread() {
++    return ::is_game_thread;
++}
++
++#if 0
++int main(int argc, char** argv) {
++    ultramodern::set_main_thread();
++
++    bootproc();
++}
++#endif
++
++#if 1
++void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg);
++#else
++#define run_thread_function(func, sp, arg) func(arg)
++#endif
++
++#if defined(_WIN32)
++void ultramodern::set_native_thread_name(const std::string& name) {
++    std::wstring wname{name.begin(), name.end()};
++
++    HRESULT r;
++    r = SetThreadDescription(
++        GetCurrentThread(),
++        wname.c_str()
++    );
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {
++    int nPriority = THREAD_PRIORITY_NORMAL;
++
++    // Convert ThreadPriority to Win32 priority
++    switch (pri) {
++        case ThreadPriority::Low:
++            nPriority = THREAD_PRIORITY_BELOW_NORMAL;
++            break;
++        case ThreadPriority::Normal:
++            nPriority = THREAD_PRIORITY_NORMAL;
++            break;
++        case ThreadPriority::High:
++            nPriority = THREAD_PRIORITY_ABOVE_NORMAL;
++            break;
++        case ThreadPriority::VeryHigh:
++            nPriority = THREAD_PRIORITY_HIGHEST;
++            break;
++        case ThreadPriority::Critical:
++            nPriority = THREAD_PRIORITY_TIME_CRITICAL;
++            break;
++        default:
++            throw std::runtime_error("Invalid thread priority!");
++            break;
++    }
++    // SetThreadPriority(GetCurrentThread(), nPriority);
++}
++#elif defined(__linux__)
++#include <sys/prctl.h>
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    if (name.length() > 15) {
++        // Linux only accepts up to 16 characters including the null terminator for a thread name.
++        debug_printf("[Thread] The thread name '%s' will be truncated to 15 characters", name.c_str());
++    }
++
++    prctl(PR_SET_NAME, name.c_str());
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {
++    // TODO linux thread priority
++    // printf("set_native_thread_priority unimplemented\n");
++    // int nPriority = THREAD_PRIORITY_NORMAL;
++
++    // // Convert ThreadPriority to Win32 priority
++    // switch (pri) {
++    //     case ThreadPriority::Low:
++    //         nPriority = THREAD_PRIORITY_BELOW_NORMAL;
++    //         break;
++    //     case ThreadPriority::Normal:
++    //         nPriority = THREAD_PRIORITY_NORMAL;
++    //         break;
++    //     case ThreadPriority::High:
++    //         nPriority = THREAD_PRIORITY_ABOVE_NORMAL;
++    //         break;
++    //     case ThreadPriority::VeryHigh:
++    //         nPriority = THREAD_PRIORITY_HIGHEST;
++    //         break;
++    //     case ThreadPriority::Critical:
++    //         nPriority = THREAD_PRIORITY_TIME_CRITICAL;
++    //         break;
++    //     default:
++    //         throw std::runtime_error("Invalid thread priority!");
++    //         break;
++    // }
++}
++#elif defined(__APPLE__)
++void ultramodern::set_native_thread_name(const std::string& name) {
++    if (name.length() > 15) {
++        // Macs seem to only accept up to 16 characters including the null terminator for a thread name.
++        debug_printf("[Thread] The thread name '%s' will be truncated to 15 characters", name.c_str());
++    }
++
++    pthread_setname_np(name.c_str());
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#endif
++
 +// [wcw2k] forward declarations (defined below with the context map).
 +static UltraThreadContext* wcw2k_get_context(RDRAM_ARG PTR(OSThread) t_);
 +static UltraThreadContext* wcw2k_get_context_host(RDRAM_ARG OSThread* t);
 +
- void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
-     thread_context->running.wait();
-     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
-     // This will trigger thread cleanup instead.
--    if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
++void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
++    thread_context->running.wait();
++    // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
++    // This will trigger thread cleanup instead.
 +    // [wcw2k] compare through the repairing accessor so a game-wiped (but live)
 +    // context doesn't read as "replaced".
 +    if (wcw2k_get_context(PASS_RDRAM ultramodern::this_thread()) != thread_context) {
-         osDestroyThread(PASS_RDRAM NULLPTR);
-     }
- }
- 
--void resume_thread(OSThread* t) {
++        osDestroyThread(PASS_RDRAM NULLPTR);
++    }
++}
++
 +void resume_thread(RDRAM_ARG OSThread* t) {
-     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
--    t->context->running.signal();
++    debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
 +    // [wcw2k] repair a game-wiped context; a thread absent from the host map was
 +    // genuinely destroyed — nothing to resume.
 +    UltraThreadContext* ctx = wcw2k_get_context_host(PASS_RDRAM t);
@@ -212,11 +733,8 @@
 +    if (it != wcw2k_context_map.end()) {
 +        it->second.priority = pri;
 +    }
- }
- 
--void run_next_thread(RDRAM_ARG1) {
--    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
--        throw std::runtime_error("No threads left to run!\n");
++}
++
 +static void wcw2k_unregister_context(PTR(OSThread) t_, UltraThreadContext* context) {
 +    std::lock_guard lock{wcw2k_context_map_mutex};
 +    auto it = wcw2k_context_map.find((int32_t)t_);
@@ -338,7 +856,7 @@
 +        }
 +        prev = cur;
 +        cur = t->next;
-     }
++    }
 +    return NULLPTR;
 +}
 +
@@ -377,10 +895,7 @@
 +    }
 +    fprintf(stderr, "\n");
 +}
- 
--    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
--    debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
--    to_run->context->running.signal();
++
 +void run_next_thread(RDRAM_ARG1) {
 +    // [wcw2k] Repair game-wiped contexts (see wcw2k_get_context); a queued thread whose
 +    // context is null even in the host map was genuinely destroyed — drop it.
@@ -406,10 +921,9 @@
 +        ctx->running.signal();
 +        return;
 +    }
- }
- 
- void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
--    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
++}
++
++void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
 +    // [wcw2k] wcw2k_get_context repairs the in-rdram pointer if the game wiped its own
 +    // TCB (WM2000's mode transitions); dump + park only if genuinely destroyed.
 +    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
@@ -423,13 +937,11 @@
 +            std::this_thread::sleep_for(std::chrono::hours(1));
 +        }
 +    }
-     run_next_thread(PASS_RDRAM1);
-     wait_for_resumed(PASS_RDRAM cur_context);
- }
- 
- void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
--    UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
--    resume_thread(t);
++    run_next_thread(PASS_RDRAM1);
++    wait_for_resumed(PASS_RDRAM cur_context);
++}
++
++void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
 +    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM thread_self);
 +    resume_thread(PASS_RDRAM t);
 +    // [wcw2k] see run_next_thread_and_wait — execution was already handed to t.
@@ -442,44 +954,81 @@
 +            std::this_thread::sleep_for(std::chrono::hours(1));
 +        }
 +    }
-     wait_for_resumed(PASS_RDRAM cur_context);
- }
- 
-@@ -186,7 +437,7 @@
-     OSThread *self = TO_PTR(OSThread, self_);
-     debug_printf("[Thread] Thread created: %d\n", self->id);
-     // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
--    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority);
++    wait_for_resumed(PASS_RDRAM cur_context);
++}
++
++static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
++    OSThread *self = TO_PTR(OSThread, self_);
++    debug_printf("[Thread] Thread created: %d\n", self->id);
++    // [wcw] map game thread ids to their entry PCs (to identify threads in traces)
 +    fprintf(stderr, "[wcw][thread] id=%d entry=0x%08X pri=%d struct=0x%08X\n", self->id, (unsigned)(uint32_t)entrypoint, self->priority, (uint32_t)self_);
-     thread_self = self_;
-     is_game_thread = true;
- 
-@@ -220,7 +471,11 @@
- 
-     // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
-     // so mark this thread as destroyed and run the next queued thread.
--    if (self->context == thread_context) {
++    thread_self = self_;
++    is_game_thread = true;
++
++    // Set the thread name
++    ultramodern::set_native_thread_name(ultramodern::threads::get_game_thread_name(self));
++    ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
++
++    // Signal the initialized semaphore to indicate that this thread can be started.
++    thread_context->initialized.signal();
++
++    debug_printf("[Thread] Thread waiting to be started: %d\n", self->id);
++
++    // Wait until the thread is marked as running.
++    try {
++        wait_for_resumed(PASS_RDRAM thread_context);
++    } catch (ultramodern::thread_terminated& terminated) {
++    }
++
++    // Make sure the thread wasn't replaced or destroyed before it was started.
++    if (self->context == thread_context) {
++        debug_printf("[Thread] Thread started: %d\n", self->id);
++        try {
++            // Run the thread's function with the provided argument.
++            run_thread_function(PASS_RDRAM entrypoint, self->sp, arg);
++        } catch (ultramodern::thread_terminated& terminated) {
++        }
++    }
++    else {
++        debug_printf("[Thread] Thread destroyed before being started: %d\n", self->id);
++    }
++
++    // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
++    // so mark this thread as destroyed and run the next queued thread.
 +    // [wcw2k] compare through the repairing accessor (a game-wiped context is still
 +    // "ours"), and drop the host-map record — this thread is gone for real.
 +    UltraThreadContext* effective_context = wcw2k_get_context(PASS_RDRAM self_);
 +    wcw2k_unregister_context(self_, thread_context);
 +    if (effective_context == thread_context) {
-         self->context = nullptr;
-         run_next_thread(PASS_RDRAM1);
-     }
-@@ -241,7 +496,7 @@
-     // Otherwise, immediately start the thread and terminate this one.
-     else {
-         t->state = OSThreadState::QUEUED;
--        resume_thread(t);
++        self->context = nullptr;
++        run_next_thread(PASS_RDRAM1);
++    }
++
++    // Dispose of this thread now that it's completed or terminated.
++    ultramodern::cleanup_thread(thread_context);
++}
++
++extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
++    OSThread* t = TO_PTR(OSThread, t_);
++    debug_printf("[os] Start Thread %d\n", t->id);
++
++    // If this is a game thread, insert the new thread into the running queue and then check the running queue.
++    if (thread_self) {
++        ultramodern::schedule_running_thread(PASS_RDRAM t_);
++        ultramodern::check_running_queue(PASS_RDRAM1);
++    }
++    // Otherwise, immediately start the thread and terminate this one.
++    else {
++        t->state = OSThreadState::QUEUED;
 +        resume_thread(PASS_RDRAM t);
-         //throw ultramodern::thread_terminated{};
-     }
- }
-@@ -250,6 +505,13 @@
-     debug_printf("[os] Create Thread %d\n", id);
-     OSThread *t = TO_PTR(OSThread, t_);
-     
++        //throw ultramodern::thread_terminated{};
++    }
++}
++
++extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_func_t) entrypoint, PTR(void) arg, PTR(void) sp, OSPri pri) {
++    debug_printf("[os] Create Thread %d\n", id);
++    OSThread *t = TO_PTR(OSThread, t_);
++    
 +    // [wcw2k] DIAGNOSTIC: struct reuse while a live host thread still references it
 +    // (WM2000 recreates threads on the same OSThread structs at menu transitions).
 +    if (t->context != nullptr) {
@@ -487,47 +1036,131 @@
 +            (uint32_t)t_, t->id, id, (uint32_t)entrypoint);
 +    }
 +
-     t->next = NULLPTR;
-     t->queue = NULLPTR;
-     t->priority = pri;
-@@ -261,6 +523,7 @@
-     // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
-     UltraThreadContext* context = new UltraThreadContext{};
-     t->context = context;
++    t->next = NULLPTR;
++    t->queue = NULLPTR;
++    t->priority = pri;
++    t->id = id;
++    t->state = OSThreadState::STOPPED;
++    t->sp = sp - 0x10; // Set up the first stack frame
++
++    // Spawn a new thread, which will immediately pause itself and wait until it's been started.
++    // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
++    UltraThreadContext* context = new UltraThreadContext{};
++    t->context = context;
 +    wcw2k_register_context(t_, context, pri, id); // [wcw2k] authoritative host-side copy
-     context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
- 
-     // Wait until the thread is initialized to indicate that it's ready to be started.
-@@ -286,6 +549,9 @@
-         t_ = thread_self;
-     }
-     OSThread* t = TO_PTR(OSThread, t_);
++    context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
++
++    // Wait until the thread is initialized to indicate that it's ready to be started.
++    context->initialized.wait();
++    debug_printf("[os] Thread %d is ready to be started\n", t->id);
++}
++
++extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
++    if (t_ == NULLPTR) {
++        t_ = thread_self;
++    }
++    // Check if the thread is stopping itself (arg is null or thread_self).
++    if (t_ == thread_self) {
++        ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
++    }
++    else {
++        assert(false);
++    }
++}
++
++extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
++    if (t_ == NULLPTR) {
++        t_ = thread_self;
++    }
++    OSThread* t = TO_PTR(OSThread, t_);
 +    // [wcw2k] DIAGNOSTIC: trace thread churn (menu-transition crash investigation).
 +    fprintf(stderr, "[wcw2k][thread] osDestroyThread target=0x%08X id=%d state=%d ctx=%s (self=0x%08X)\n",
 +        (uint32_t)t_, t->id, (int)t->state, t->context ? "live" : "null", (uint32_t)thread_self);
-     // Check if the thread is destroying itself (arg is null or thread_self)
-     if (t_ == thread_self) {
-         throw ultramodern::thread_terminated{};
-@@ -295,7 +561,10 @@
-         ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
-     }
-     // Check if the thread has already been destroyed to prevent destroying it again.
--    UltraThreadContext* cur_context = t->context;
++    // Check if the thread is destroying itself (arg is null or thread_self)
++    if (t_ == thread_self) {
++        throw ultramodern::thread_terminated{};
++    }
++    // Otherwise if the thread isn't stopped, remove it from its currrent queue., 
++    if (t->state != OSThreadState::STOPPED) {
++        ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++    }
++    // Check if the thread has already been destroyed to prevent destroying it again.
 +    // [wcw2k] repair a game-wiped pointer first so wiped-then-destroyed threads get
 +    // full cleanup, and drop the host-map record — this is genuine destruction.
 +    UltraThreadContext* cur_context = wcw2k_get_context(PASS_RDRAM t_);
 +    wcw2k_unregister_context(t_, cur_context);
-     if (cur_context != nullptr) {
-         // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
-         t->context = nullptr;
-@@ -311,6 +580,7 @@
- 
-     if (t->priority != pri) {
-         t->priority = pri;
++    if (cur_context != nullptr) {
++        // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
++        t->context = nullptr;
++        cur_context->running.signal();
++    }
++}
++
++extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
++    if (t_ == NULLPTR) {
++        t_ = thread_self;
++    }
++    OSThread* t = TO_PTR(OSThread, t_);
++
++    if (t->priority != pri) {
++        t->priority = pri;
 +        wcw2k_update_priority(t_, pri); // [wcw2k] keep the host-side record in sync
- 
-         if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
-             ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++
++        if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
++            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
++        }
++
++        ultramodern::check_running_queue(PASS_RDRAM1);
++    }
++}
++
++extern "C" OSPri osGetThreadPri(RDRAM_ARG PTR(OSThread) t) {
++    if (t == NULLPTR) {
++        t = thread_self;
++    }
++    return TO_PTR(OSThread, t)->priority;
++}
++
++extern "C" OSId osGetThreadId(RDRAM_ARG PTR(OSThread) t) {
++    if (t == NULLPTR) {
++        t = thread_self;
++    }
++    return TO_PTR(OSThread, t)->id;
++}
++
++PTR(OSThread) ultramodern::this_thread() {
++    return thread_self;
++}
++
++static std::thread thread_cleaner_thread;
++static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{};
++extern std::atomic_bool exited;
++
++void thread_cleaner_func() {
++    using namespace std::chrono_literals;
++    while (!exited) {
++        UltraThreadContext* to_delete;
++        if (deleted_threads.wait_dequeue_timed(to_delete, 10ms)) {
++            debug_printf("[Cleanup] Deleting thread context %p\n", to_delete);
++
++            to_delete->host_thread.join();
++            delete to_delete;
++        }
++    }
++}
++
++void ultramodern::init_thread_cleanup() {
++    thread_cleaner_thread = std::thread{thread_cleaner_func};
++}
++
++void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
++    deleted_threads.enqueue(cur_context);
++}
++
++void ultramodern::join_thread_cleaner_thread() {
++    thread_cleaner_thread.join();
++}
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/scheduling.cpp	2026-07-07 15:35:26.738994100 -0400
 +++ lib/N64ModernRuntime/ultramodern/src/scheduling.cpp	2026-07-08 23:15:18.916086500 -0400
 @@ -2,6 +2,10 @@
@@ -590,10 +1223,467 @@
      while (*cur) {
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-07 15:35:26.737491200 -0400
 +++ lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-08 23:12:59.263596300 -0400
-@@ -66,6 +66,19 @@
-     }
- }
- 
+@@ -1,392 +1,425 @@
+-#include <thread>
+-#include <atomic>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <cstring>
+-#ifdef _WIN32
+-#define WIN32_LEAN_AND_MEAN
+-#include <windows.h>
+-#endif
+-
+-#include "blockingconcurrentqueue.h"
+-
+-#include "ultramodern/ultra64.h"
+-#include "ultramodern/ultramodern.hpp"
+-
+-struct QueuedMessage {
+-    PTR(OSMesgQueue) mq;
+-    OSMesg mesg;
+-    bool jam;
+-    bool requeue_if_blocked;
+-    int64_t enqueue_ms; // [wcw fix] set at enqueue; bounds how long an undeliverable message may requeue
+-};
+-
+-static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
+-
+-// [wcw fix] Grace window for undeliverable requeue_if_blocked messages, after which they are
+-// dropped. On hardware, completion/event messages (PI DMA done, SI/VI/AI events) are posted with
+-// OS_MESG_NOBLOCK and silently DROPPED if the target queue is full — a game may legally
+-// fire-and-forget DMAs (WCW does, from three separate DMA queues) and never receive them.
+-// requeue_if_blocked exists because librecomp's DMAs complete instantly (the completion can
+-// arrive while the game's queue is momentarily full, where real DMA latency would have let the
+-// game drain it first), so messages must be retried briefly — but retrying FOREVER makes every
+-// orphaned completion permanent: the external_messages backlog grows without bound (~55/s
+-// during WCW gameplay) and every osSendMesg/osRecvMesg drains-and-requeues the whole backlog,
+-// i.e. O(backlog) work per call under message_mutex. Measured result: game slowdown and starved
+-// message delivery (SFX loss) after ~4 minutes of play, persisting until restart. One second is
+-// orders of magnitude longer than any transient queue-full window (a frame or two) yet still
+-// emulates the hardware drop.
+-constexpr int64_t requeue_grace_ms = 1000;
+-
+-static int64_t wcw_steady_ms() {
+-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-}
+-
+-void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+-    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, wcw_steady_ms()});
+-}
+-
+-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+-
+-// [wcw] DIAGNOSTIC counters for the 1/s [wcw][health] line: requeue churn (undeliverable
+-// requeue_if_blocked messages put back on external_messages), per-second delivery counts,
+-// and messages dropped after exhausting the requeue grace window.
+-std::atomic_int wcw_requeues{0}, wcw_extmsg_delivered{0}, wcw_extmsg_dropped{0};
+-
+-// [wcw] DIAGNOSTIC: small histogram of the (mq, msg) pairs being requeued, to identify WHICH
+-// message is undeliverable when the backlog grows. Lossy/racy by design (diagnostic only).
+-struct WcwRequeueSlot { std::atomic<uint64_t> key{0}; std::atomic<uint32_t> count{0}; };
+-static WcwRequeueSlot wcw_requeue_hist[4];
+-static void wcw_note_requeue(PTR(OSMesgQueue) mq, OSMesg msg) {
+-    uint64_t key = ((uint64_t)(uint32_t)mq << 32) | (uint32_t)msg;
+-    for (auto& slot : wcw_requeue_hist) {
+-        uint64_t cur = slot.key.load(std::memory_order_relaxed);
+-        if (cur == key) { slot.count.fetch_add(1, std::memory_order_relaxed); return; }
+-        if (cur == 0) { slot.key.store(key, std::memory_order_relaxed); slot.count.fetch_add(1, std::memory_order_relaxed); return; }
+-    }
+-}
+-
+-void dequeue_external_messages(RDRAM_ARG1) {
+-    QueuedMessage to_send;
+-    std::vector<QueuedMessage> requeued_messages{};
+-    int64_t now_ms = wcw_steady_ms();
+-    while (external_messages.try_dequeue(to_send)) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            // [wcw fix] Undeliverable: retry within the grace window, then drop (hardware
+-            // semantics — NOBLOCK completion posts into a full queue are lost).
+-            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
+-                requeued_messages.push_back(to_send);
+-                wcw_note_requeue(to_send.mq, to_send.mesg);
+-            }
+-            else {
+-                wcw_extmsg_dropped.fetch_add(1);
+-            }
+-        }
+-        else {
+-            wcw_extmsg_delivered.fetch_add(1);
+-        }
+-    }
+-    wcw_requeues.fetch_add((int)requeued_messages.size());
+-    for (QueuedMessage& cur_mesg : requeued_messages) {
+-        external_messages.enqueue(cur_mesg);
+-    }
+-}
+-
+-// [wcw] DIAGNOSTIC (env WCW_HEALTH_LOG=1, 1 line/s): game health snapshot. viswaps/s = real
+-// game frame rate; ext=N = external_messages backlog (undeliverable requeued messages make
+-// this grow — every osSendMesg/osRecvMesg on a game thread drains this queue, so a standing
+-// backlog is O(N) work per call and a direct slowdown mechanism); rq/s = requeue churn;
+-// del/s = deliveries; drop/s = orphaned messages expired by the requeue grace window. This is
+-// the instrumentation that root-caused the 4-minute in-match slowdown/SFX-loss (see the
+-// requeue_grace_ms comment above).
+-void wcw_health_tick() {
+-    static const bool enabled = getenv("WCW_HEALTH_LOG") != nullptr;
+-    if (!enabled) {
+-        return;
+-    }
+-    extern std::atomic_int wcw_viswaps;
+-    static int64_t last_ms = 0;
+-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-    if (last_ms == 0) { last_ms = now; return; }
+-    if (now - last_ms < 1000) { return; }
+-    last_ms = now;
+-    char hist[128] = "";
+-    for (auto& slot : wcw_requeue_hist) {
+-        uint64_t key = slot.key.load(std::memory_order_relaxed);
+-        uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
+-        if (key != 0 && cnt != 0) {
+-            size_t len = strlen(hist);
+-            snprintf(hist + len, sizeof(hist) - len, " mq=0x%X/msg=0x%X:%u",
+-                (uint32_t)(key >> 32), (uint32_t)key, cnt);
+-        }
+-    }
+-    fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d%s\n",
+-        wcw_viswaps.exchange(0), external_messages.size_approx(),
+-        wcw_requeues.exchange(0), wcw_extmsg_delivered.exchange(0),
+-        wcw_extmsg_dropped.exchange(0), hist);
+-}
+-
+-void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+-    // [wcw fix] Drain every available message per wake instead of processing exactly one.
+-    // The single-message version deadlocked: on delivery failure it re-enqueued immediately,
+-    // and moodycamel's consumer bias then dequeued that same producer's item right back —
+-    // an undeliverable requeue_if_blocked message (full 1-deep target queue) spun forever
+-    // and starved every other producer's messages (VI retrace included), freezing the game.
+-    QueuedMessage to_send;
+-    thread_local std::vector<QueuedMessage> requeued_messages;
+-    requeued_messages.clear();
+-    bool delivered_any = false;
+-    external_messages.wait_dequeue(to_send);
+-    int64_t now_ms = wcw_steady_ms();
+-    do {
+-        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
+-            delivered_any = true;
+-        }
+-        else if (to_send.requeue_if_blocked) {
+-            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
+-            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
+-                requeued_messages.push_back(to_send);
+-                wcw_note_requeue(to_send.mq, to_send.mesg);
+-            }
+-            else {
+-                wcw_extmsg_dropped.fetch_add(1);
+-            }
+-        }
+-    } while (external_messages.try_dequeue(to_send));
+-    wcw_requeues.fetch_add((int)requeued_messages.size());
+-    for (QueuedMessage& cur_mesg : requeued_messages) {
+-        external_messages.enqueue(cur_mesg);
+-    }
+-    // If nothing was deliverable, don't burn a core cycling the requeued messages.
+-    if (!delivered_any && !requeued_messages.empty()) {
+-        ultramodern::sleep_milliseconds(1);
+-    }
+-}
+-
+-void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+-    QueuedMessage to_send;
+-    if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
+-            if (wcw_steady_ms() - to_send.enqueue_ms <= requeue_grace_ms) {
+-                external_messages.enqueue(to_send);
+-            }
+-            else {
+-                wcw_extmsg_dropped.fetch_add(1);
+-            }
+-        }
+-    }
+-}
+-
+-extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+-    mq->blocked_on_recv = NULLPTR;
+-    mq->blocked_on_send = NULLPTR;
+-    mq->msgCount = count;
+-    mq->msg = msg;
+-    mq->validCount = 0;
+-    mq->first = 0;
+-}
+-
+-s32 MQ_GET_COUNT(OSMesgQueue *mq) {
+-    return mq->validCount;
+-}
+-
+-s32 MQ_IS_EMPTY(OSMesgQueue *mq) {
+-    return mq->validCount == 0;
+-}
+-
+-s32 MQ_IS_FULL(OSMesgQueue* mq) {
+-    return MQ_GET_COUNT(mq) >= mq->msgCount;
+-}
+-
+-// [wcw] DIAGNOSTIC counters: SP/DP completion delivery accounting (msg 0x29B/0x29C).
+-std::atomic_int wcw_spb_delivered{0}, wcw_spb_full{0}, wcw_dpc_delivered{0}, wcw_dpc_full{0};
+-
+-// [wcw] DIAGNOSTIC: AI/VI event delivery accounting (enqueue timestamps set in events.cpp's
+-// VI thread; latency = enqueue -> do_send delivery). Drops = target queue already full.
+-#include <chrono>
+-static int64_t wcw_now_ms() {
+-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-}
+-std::atomic<uint32_t> wcw_ai_mq{0}, wcw_vi_mq{0};
+-std::atomic<int64_t> wcw_ai_enq_ms{0}, wcw_vi_enq_ms{0};
+-std::atomic_int wcw_ai_del{0}, wcw_ai_drop{0}, wcw_vi_del{0}, wcw_vi_drop{0};
+-std::atomic<int64_t> wcw_ai_maxlat{0}, wcw_vi_maxlat{0};
+-
+-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+-    OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+-    if (!block) {
+-        // If non-blocking, fail if the queue is full.
+-        if (MQ_IS_FULL(mq)) {
+-            if ((uint32_t)msg == 0x29B) wcw_spb_full.fetch_add(1);
+-            if ((uint32_t)msg == 0x29C) wcw_dpc_full.fetch_add(1);
+-            if ((uint32_t)mq_ == wcw_ai_mq.load()) wcw_ai_drop.fetch_add(1);
+-            if ((uint32_t)mq_ == wcw_vi_mq.load()) wcw_vi_drop.fetch_add(1);
+-            return false;
+-        }
+-    }
+-    else {
+-        // Otherwise, yield this thread until the queue has room.
+-        // ([wcw] NOTE: an earlier diagnostic insertion here accidentally rebound this else to the
+-        // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
+-        while (MQ_IS_FULL(mq)) {
+-            debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+-            ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
+-            ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+-        }
+-    }
+-    if ((uint32_t)msg == 0x29B) wcw_spb_delivered.fetch_add(1);
+-    if ((uint32_t)msg == 0x29C) wcw_dpc_delivered.fetch_add(1);
+-    if ((uint32_t)mq_ == wcw_ai_mq.load()) {
+-        wcw_ai_del.fetch_add(1);
+-        int64_t lat = wcw_now_ms() - wcw_ai_enq_ms.load();
+-        if (lat > wcw_ai_maxlat.load()) wcw_ai_maxlat.store(lat);
+-    }
+-    if ((uint32_t)mq_ == wcw_vi_mq.load()) {
+-        wcw_vi_del.fetch_add(1);
+-        int64_t lat = wcw_now_ms() - wcw_vi_enq_ms.load();
+-        if (lat > wcw_vi_maxlat.load()) wcw_vi_maxlat.store(lat);
+-    }
+-    
+-    if (jam) {
+-        // Jams insert at the head of the message queue's buffer.
+-        mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;
+-        TO_PTR(OSMesg, mq->msg)[mq->first] = msg;
+-        mq->validCount++;
+-    }
+-    else {
+-        // Sends insert at the tail of the message queue's buffer.
+-        s32 last = (mq->first + mq->validCount) % mq->msgCount;
+-        TO_PTR(OSMesg, mq->msg)[last] = msg;
+-        mq->validCount++;
+-    }
+-
+-    // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
+-    PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
+-    if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
+-        ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
+-    }
+-    
+-    return true;
+-}
+-
+-bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+-    OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+-    if (!block) {
+-        // If non-blocking, fail if the queue is empty
+-        if (MQ_IS_EMPTY(mq)) {
+-            return false;
+-        }
+-    } else {
+-        // Otherwise, yield this thread in a loop until the queue is no longer full
+-        while (MQ_IS_EMPTY(mq)) {
+-            debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+-            ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
+-            ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+-        }
+-    }
+-
+-    if (msg_ != NULLPTR) {
+-        *TO_PTR(OSMesg, msg_) = TO_PTR(OSMesg, mq->msg)[mq->first];
+-    }
+-    
+-    mq->first = (mq->first + 1) % mq->msgCount;
+-    mq->validCount--;
+-
+-    // If any threads were blocked on sending to this message queue, pop the first one and schedule it.
+-    PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_send);
+-    if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
+-        ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
+-    }
+-
+-    return true;
+-}
+-
+-extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
+-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+-    bool jam = false;
+-    
+-    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
+-    if (!ultramodern::is_game_thread()) {
+-        ultramodern::enqueue_external_message(mq_, msg, jam, false);
+-        return 0;
+-    }
+-    
+-    // Handle any messages that have been received from an external thread.
+-    dequeue_external_messages(PASS_RDRAM1);
+-
+-    // [wcw] DIAGNOSTIC: every frame-ready (send to 0x80040FC0) log the present pointer the game
+-    // left in 0x80040FFC — nonzero = func_800033A0 present-with-DL, zero = func_800033E8 sync-only.
+-    if ((uint32_t)mq_ == 0x80040FC0) {
+-        static int fn = 0;
+-        if (fn++ < 80) {
+-            uint32_t off = 0x40FFC;
+-            uint32_t pp = ((uint32_t)rdram[(off+0)^3] << 24) | ((uint32_t)rdram[(off+1)^3] << 16)
+-                        | ((uint32_t)rdram[(off+2)^3] << 8)  | ((uint32_t)rdram[(off+3)^3]);
+-            fprintf(stderr, "[wcw][frame#%d] presentptr=0x%08X\n", fn, pp);
+-        }
+-    }
+-
+-    // Try to send the message.
+-    bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
+-
+-    // Check the queue to see if this thread should swap execution to another.
+-    ultramodern::check_running_queue(PASS_RDRAM1);
+-
+-    return sent ? 0 : -1;
+-}
+-
+-extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
+-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+-    bool jam = true;
+-    
+-    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
+-    if (!ultramodern::is_game_thread()) {
+-        ultramodern::enqueue_external_message(mq_, msg, jam, false);
+-        return 0;
+-    }
+-    
+-    // Handle any messages that have been received from an external thread.
+-    dequeue_external_messages(PASS_RDRAM1);
+-
+-    // Try to send the message.
+-    bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
+-    
+-    // Check the queue to see if this thread should swap execution to another.
+-    ultramodern::check_running_queue(PASS_RDRAM1);
+-
+-    return sent ? 0 : -1;
+-}
+-
+-extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
+-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+-    
+-    assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
+-    
+-    // Handle any messages that have been received from an external thread.
+-    dequeue_external_messages(PASS_RDRAM1);
+-
+-    // [wcw] DIAGNOSTIC: trace recv calls to find where the game thread parks.
+-    static int rn = 0;
+-    if (rn < 80) fprintf(stderr, "[wcw][recv#%d] mq=0x%X block=%d validCount=%d\n", rn, (unsigned)mq_, (int)(flags == OS_MESG_BLOCK), mq ? (int)mq->validCount : -1);
+-#ifdef _WIN32
+-    if (rn == 0 && flags == OS_MESG_BLOCK) {
+-        void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, nullptr);
+-        HMODULE base = GetModuleHandleW(nullptr);
+-        fprintf(stderr, "[wcw][recv#0] base=%p frames:", (void*)base);
+-        for (unsigned short i = 0; i < n; i++) fprintf(stderr, " +0x%llX", (unsigned long long)((uintptr_t)fr[i] - (uintptr_t)base));
+-        fprintf(stderr, "\n");
+-    }
+-#endif
+-    rn++;
+-
+-    // Try to receive a message.
+-    bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
+-
+-    // Check the queue to see if this thread should swap execution to another.
+-    ultramodern::check_running_queue(PASS_RDRAM1);
+-
+-    if (rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
+-    return received ? 0 : -1;
+-}
++#include <thread>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++#include "blockingconcurrentqueue.h"
++
++#include "ultramodern/ultra64.h"
++#include "ultramodern/ultramodern.hpp"
++
++struct QueuedMessage {
++    PTR(OSMesgQueue) mq;
++    OSMesg mesg;
++    bool jam;
++    bool requeue_if_blocked;
++    int64_t enqueue_ms; // [wcw fix] set at enqueue; bounds how long an undeliverable message may requeue
++};
++
++static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
++
++// [wcw fix] Grace window for undeliverable requeue_if_blocked messages, after which they are
++// dropped. On hardware, completion/event messages (PI DMA done, SI/VI/AI events) are posted with
++// OS_MESG_NOBLOCK and silently DROPPED if the target queue is full — a game may legally
++// fire-and-forget DMAs (WCW does, from three separate DMA queues) and never receive them.
++// requeue_if_blocked exists because librecomp's DMAs complete instantly (the completion can
++// arrive while the game's queue is momentarily full, where real DMA latency would have let the
++// game drain it first), so messages must be retried briefly — but retrying FOREVER makes every
++// orphaned completion permanent: the external_messages backlog grows without bound (~55/s
++// during WCW gameplay) and every osSendMesg/osRecvMesg drains-and-requeues the whole backlog,
++// i.e. O(backlog) work per call under message_mutex. Measured result: game slowdown and starved
++// message delivery (SFX loss) after ~4 minutes of play, persisting until restart. One second is
++// orders of magnitude longer than any transient queue-full window (a frame or two) yet still
++// emulates the hardware drop.
++constexpr int64_t requeue_grace_ms = 1000;
++
++static int64_t wcw_steady_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
++    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, wcw_steady_ms()});
++}
++
++bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
++
++// [wcw] DIAGNOSTIC counters for the 1/s [wcw][health] line: requeue churn (undeliverable
++// requeue_if_blocked messages put back on external_messages), per-second delivery counts,
++// and messages dropped after exhausting the requeue grace window.
++std::atomic_int wcw_requeues{0}, wcw_extmsg_delivered{0}, wcw_extmsg_dropped{0};
++
++// [wcw] DIAGNOSTIC: small histogram of the (mq, msg) pairs being requeued, to identify WHICH
++// message is undeliverable when the backlog grows. Lossy/racy by design (diagnostic only).
++struct WcwRequeueSlot { std::atomic<uint64_t> key{0}; std::atomic<uint32_t> count{0}; };
++static WcwRequeueSlot wcw_requeue_hist[4];
++static void wcw_note_requeue(PTR(OSMesgQueue) mq, OSMesg msg) {
++    uint64_t key = ((uint64_t)(uint32_t)mq << 32) | (uint32_t)msg;
++    for (auto& slot : wcw_requeue_hist) {
++        uint64_t cur = slot.key.load(std::memory_order_relaxed);
++        if (cur == key) { slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++        if (cur == 0) { slot.key.store(key, std::memory_order_relaxed); slot.count.fetch_add(1, std::memory_order_relaxed); return; }
++    }
++}
++
 +// [wcw2k] DIAGNOSTIC: per-(mq,msg) histogram of successful EXTERNAL deliveries, printed on the
 +// 1/s health line. Attributes an elevated del/s (e.g. WM2000's ~700/s vs ~190/s healthy — the
 +// high-priority audio-chain saturation that starves the pri-8 game loop) to its source queue.
@@ -607,30 +1697,61 @@
 +    }
 +}
 +
- void dequeue_external_messages(RDRAM_ARG1) {
-     QueuedMessage to_send;
-     std::vector<QueuedMessage> requeued_messages{};
-@@ -84,6 +97,7 @@
-         }
-         else {
-             wcw_extmsg_delivered.fetch_add(1);
++void dequeue_external_messages(RDRAM_ARG1) {
++    QueuedMessage to_send;
++    std::vector<QueuedMessage> requeued_messages{};
++    int64_t now_ms = wcw_steady_ms();
++    while (external_messages.try_dequeue(to_send)) {
++        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
++            // [wcw fix] Undeliverable: retry within the grace window, then drop (hardware
++            // semantics — NOBLOCK completion posts into a full queue are lost).
++            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
++                requeued_messages.push_back(to_send);
++                wcw_note_requeue(to_send.mq, to_send.mesg);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
++        }
++        else {
++            wcw_extmsg_delivered.fetch_add(1);
 +            wcw2k_note_delivery(to_send.mq, to_send.mesg);
-         }
-     }
-     wcw_requeues.fetch_add((int)requeued_messages.size());
-@@ -110,7 +124,7 @@
-     if (last_ms == 0) { last_ms = now; return; }
-     if (now - last_ms < 1000) { return; }
-     last_ms = now;
--    char hist[128] = "";
++        }
++    }
++    wcw_requeues.fetch_add((int)requeued_messages.size());
++    for (QueuedMessage& cur_mesg : requeued_messages) {
++        external_messages.enqueue(cur_mesg);
++    }
++}
++
++// [wcw] DIAGNOSTIC (env WCW_HEALTH_LOG=1, 1 line/s): game health snapshot. viswaps/s = real
++// game frame rate; ext=N = external_messages backlog (undeliverable requeued messages make
++// this grow — every osSendMesg/osRecvMesg on a game thread drains this queue, so a standing
++// backlog is O(N) work per call and a direct slowdown mechanism); rq/s = requeue churn;
++// del/s = deliveries; drop/s = orphaned messages expired by the requeue grace window. This is
++// the instrumentation that root-caused the 4-minute in-match slowdown/SFX-loss (see the
++// requeue_grace_ms comment above).
++void wcw_health_tick() {
++    static const bool enabled = getenv("WCW_HEALTH_LOG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    extern std::atomic_int wcw_viswaps;
++    static int64_t last_ms = 0;
++    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (last_ms == 0) { last_ms = now; return; }
++    if (now - last_ms < 1000) { return; }
++    last_ms = now;
 +    char hist[256] = "";
-     for (auto& slot : wcw_requeue_hist) {
-         uint64_t key = slot.key.load(std::memory_order_relaxed);
-         uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
-@@ -120,6 +134,16 @@
-                 (uint32_t)(key >> 32), (uint32_t)key, cnt);
-         }
-     }
++    for (auto& slot : wcw_requeue_hist) {
++        uint64_t key = slot.key.load(std::memory_order_relaxed);
++        uint32_t cnt = slot.count.exchange(0, std::memory_order_relaxed);
++        if (key != 0 && cnt != 0) {
++            size_t len = strlen(hist);
++            snprintf(hist + len, sizeof(hist) - len, " mq=0x%X/msg=0x%X:%u",
++                (uint32_t)(key >> 32), (uint32_t)key, cnt);
++        }
++    }
 +    // [wcw2k] per-mq delivery attribution (see wcw2k_deliver_hist above).
 +    for (auto& slot : wcw2k_deliver_hist) {
 +        uint64_t key = slot.key.load(std::memory_order_relaxed);
@@ -641,41 +1762,310 @@
 +                (uint32_t)(key >> 32), (uint32_t)key, cnt);
 +        }
 +    }
-     fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d%s\n",
-         wcw_viswaps.exchange(0), external_messages.size_approx(),
-         wcw_requeues.exchange(0), wcw_extmsg_delivered.exchange(0),
-@@ -141,6 +165,7 @@
-     do {
-         if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
-             delivered_any = true;
++    fprintf(stderr, "[wcw][health] vis/s=%d ext=%zu rq/s=%d del/s=%d drop/s=%d%s\n",
++        wcw_viswaps.exchange(0), external_messages.size_approx(),
++        wcw_requeues.exchange(0), wcw_extmsg_delivered.exchange(0),
++        wcw_extmsg_dropped.exchange(0), hist);
++}
++
++void ultramodern::wait_for_external_message(RDRAM_ARG1) {
++    // [wcw fix] Drain every available message per wake instead of processing exactly one.
++    // The single-message version deadlocked: on delivery failure it re-enqueued immediately,
++    // and moodycamel's consumer bias then dequeued that same producer's item right back —
++    // an undeliverable requeue_if_blocked message (full 1-deep target queue) spun forever
++    // and starved every other producer's messages (VI retrace included), freezing the game.
++    QueuedMessage to_send;
++    thread_local std::vector<QueuedMessage> requeued_messages;
++    requeued_messages.clear();
++    bool delivered_any = false;
++    external_messages.wait_dequeue(to_send);
++    int64_t now_ms = wcw_steady_ms();
++    do {
++        if (do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++            delivered_any = true;
 +            wcw2k_note_delivery(to_send.mq, to_send.mesg);
-         }
-         else if (to_send.requeue_if_blocked) {
-             // [wcw fix] Same grace-window drop as dequeue_external_messages above.
-@@ -232,6 +257,10 @@
-         // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
-         while (MQ_IS_FULL(mq)) {
-             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++        }
++        else if (to_send.requeue_if_blocked) {
++            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
++            if (now_ms - to_send.enqueue_ms <= requeue_grace_ms) {
++                requeued_messages.push_back(to_send);
++                wcw_note_requeue(to_send.mq, to_send.mesg);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
++        }
++    } while (external_messages.try_dequeue(to_send));
++    wcw_requeues.fetch_add((int)requeued_messages.size());
++    for (QueuedMessage& cur_mesg : requeued_messages) {
++        external_messages.enqueue(cur_mesg);
++    }
++    // If nothing was deliverable, don't burn a core cycling the requeued messages.
++    if (!delivered_any && !requeued_messages.empty()) {
++        ultramodern::sleep_milliseconds(1);
++    }
++}
++
++void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
++    QueuedMessage to_send;
++    if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
++        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
++            // [wcw fix] Same grace-window drop as dequeue_external_messages above.
++            if (wcw_steady_ms() - to_send.enqueue_ms <= requeue_grace_ms) {
++                external_messages.enqueue(to_send);
++            }
++            else {
++                wcw_extmsg_dropped.fetch_add(1);
++            }
++        }
++    }
++}
++
++extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
++    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    mq->blocked_on_recv = NULLPTR;
++    mq->blocked_on_send = NULLPTR;
++    mq->msgCount = count;
++    mq->msg = msg;
++    mq->validCount = 0;
++    mq->first = 0;
++}
++
++s32 MQ_GET_COUNT(OSMesgQueue *mq) {
++    return mq->validCount;
++}
++
++s32 MQ_IS_EMPTY(OSMesgQueue *mq) {
++    return mq->validCount == 0;
++}
++
++s32 MQ_IS_FULL(OSMesgQueue* mq) {
++    return MQ_GET_COUNT(mq) >= mq->msgCount;
++}
++
++// [wcw] DIAGNOSTIC counters: SP/DP completion delivery accounting (msg 0x29B/0x29C).
++std::atomic_int wcw_spb_delivered{0}, wcw_spb_full{0}, wcw_dpc_delivered{0}, wcw_dpc_full{0};
++
++// [wcw] DIAGNOSTIC: AI/VI event delivery accounting (enqueue timestamps set in events.cpp's
++// VI thread; latency = enqueue -> do_send delivery). Drops = target queue already full.
++#include <chrono>
++static int64_t wcw_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++std::atomic<uint32_t> wcw_ai_mq{0}, wcw_vi_mq{0};
++std::atomic<int64_t> wcw_ai_enq_ms{0}, wcw_vi_enq_ms{0};
++std::atomic_int wcw_ai_del{0}, wcw_ai_drop{0}, wcw_vi_del{0}, wcw_vi_drop{0};
++std::atomic<int64_t> wcw_ai_maxlat{0}, wcw_vi_maxlat{0};
++
++bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
++    OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
++    if (!block) {
++        // If non-blocking, fail if the queue is full.
++        if (MQ_IS_FULL(mq)) {
++            if ((uint32_t)msg == 0x29B) wcw_spb_full.fetch_add(1);
++            if ((uint32_t)msg == 0x29C) wcw_dpc_full.fetch_add(1);
++            if ((uint32_t)mq_ == wcw_ai_mq.load()) wcw_ai_drop.fetch_add(1);
++            if ((uint32_t)mq_ == wcw_vi_mq.load()) wcw_vi_drop.fetch_add(1);
++            return false;
++        }
++    }
++    else {
++        // Otherwise, yield this thread until the queue has room.
++        // ([wcw] NOTE: an earlier diagnostic insertion here accidentally rebound this else to the
++        // msg==0x29C check, letting blocking 0x29C sends post into a full queue. Restored.)
++        while (MQ_IS_FULL(mq)) {
++            debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
 +            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
 +            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
 +            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X SEND mq=0x%08X\n",
 +                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
-             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
-             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
-         }
-@@ -282,6 +311,10 @@
-         // Otherwise, yield this thread in a loop until the queue is no longer full
-         while (MQ_IS_EMPTY(mq)) {
-             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
++            ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
++            ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
++        }
++    }
++    if ((uint32_t)msg == 0x29B) wcw_spb_delivered.fetch_add(1);
++    if ((uint32_t)msg == 0x29C) wcw_dpc_delivered.fetch_add(1);
++    if ((uint32_t)mq_ == wcw_ai_mq.load()) {
++        wcw_ai_del.fetch_add(1);
++        int64_t lat = wcw_now_ms() - wcw_ai_enq_ms.load();
++        if (lat > wcw_ai_maxlat.load()) wcw_ai_maxlat.store(lat);
++    }
++    if ((uint32_t)mq_ == wcw_vi_mq.load()) {
++        wcw_vi_del.fetch_add(1);
++        int64_t lat = wcw_now_ms() - wcw_vi_enq_ms.load();
++        if (lat > wcw_vi_maxlat.load()) wcw_vi_maxlat.store(lat);
++    }
++    
++    if (jam) {
++        // Jams insert at the head of the message queue's buffer.
++        mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;
++        TO_PTR(OSMesg, mq->msg)[mq->first] = msg;
++        mq->validCount++;
++    }
++    else {
++        // Sends insert at the tail of the message queue's buffer.
++        s32 last = (mq->first + mq->validCount) % mq->msgCount;
++        TO_PTR(OSMesg, mq->msg)[last] = msg;
++        mq->validCount++;
++    }
++
++    // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
++    PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
++    if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
++        ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
++    }
++    
++    return true;
++}
++
++bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
++    OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
++    if (!block) {
++        // If non-blocking, fail if the queue is empty
++        if (MQ_IS_EMPTY(mq)) {
++            return false;
++        }
++    } else {
++        // Otherwise, yield this thread in a loop until the queue is no longer full
++        while (MQ_IS_EMPTY(mq)) {
++            debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
 +            // [wcw2k] WCW_BLOCK_LOG=1: trace where threads park (wedge diagnosis)
 +            static const bool wcw_block_log = getenv("WCW_BLOCK_LOG") != nullptr;
 +            if (wcw_block_log) fprintf(stderr, "[wcw2k][block] id=%d self=0x%08X RECV mq=0x%08X\n",
 +                TO_PTR(OSThread, ultramodern::this_thread())->id, (uint32_t)ultramodern::this_thread(), (uint32_t)mq_);
-             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
-             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
-         }
++            ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
++            ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
++        }
++    }
++
++    if (msg_ != NULLPTR) {
++        *TO_PTR(OSMesg, msg_) = TO_PTR(OSMesg, mq->msg)[mq->first];
++    }
++    
++    mq->first = (mq->first + 1) % mq->msgCount;
++    mq->validCount--;
++
++    // If any threads were blocked on sending to this message queue, pop the first one and schedule it.
++    PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_send);
++    if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
++        ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
++    }
++
++    return true;
++}
++
++extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
++    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    bool jam = false;
++    
++    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
++    if (!ultramodern::is_game_thread()) {
++        ultramodern::enqueue_external_message(mq_, msg, jam, false);
++        return 0;
++    }
++    
++    // Handle any messages that have been received from an external thread.
++    dequeue_external_messages(PASS_RDRAM1);
++
++    // [wcw] DIAGNOSTIC: every frame-ready (send to 0x80040FC0) log the present pointer the game
++    // left in 0x80040FFC — nonzero = func_800033A0 present-with-DL, zero = func_800033E8 sync-only.
++    if ((uint32_t)mq_ == 0x80040FC0) {
++        static int fn = 0;
++        if (fn++ < 80) {
++            uint32_t off = 0x40FFC;
++            uint32_t pp = ((uint32_t)rdram[(off+0)^3] << 24) | ((uint32_t)rdram[(off+1)^3] << 16)
++                        | ((uint32_t)rdram[(off+2)^3] << 8)  | ((uint32_t)rdram[(off+3)^3]);
++            fprintf(stderr, "[wcw][frame#%d] presentptr=0x%08X\n", fn, pp);
++        }
++    }
++
++    // Try to send the message.
++    bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
++
++    // Check the queue to see if this thread should swap execution to another.
++    ultramodern::check_running_queue(PASS_RDRAM1);
++
++    return sent ? 0 : -1;
++}
++
++extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
++    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    bool jam = true;
++    
++    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
++    if (!ultramodern::is_game_thread()) {
++        ultramodern::enqueue_external_message(mq_, msg, jam, false);
++        return 0;
++    }
++    
++    // Handle any messages that have been received from an external thread.
++    dequeue_external_messages(PASS_RDRAM1);
++
++    // Try to send the message.
++    bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
++    
++    // Check the queue to see if this thread should swap execution to another.
++    ultramodern::check_running_queue(PASS_RDRAM1);
++
++    return sent ? 0 : -1;
++}
++
++extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
++    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    
++    assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
++    
++    // Handle any messages that have been received from an external thread.
++    dequeue_external_messages(PASS_RDRAM1);
++
++    // [wcw] DIAGNOSTIC: trace recv calls to find where the game thread parks.
++    static int rn = 0;
++    if (rn < 80) fprintf(stderr, "[wcw][recv#%d] mq=0x%X block=%d validCount=%d\n", rn, (unsigned)mq_, (int)(flags == OS_MESG_BLOCK), mq ? (int)mq->validCount : -1);
++#ifdef _WIN32
++    if (rn == 0 && flags == OS_MESG_BLOCK) {
++        void* fr[24]; unsigned short n = RtlCaptureStackBackTrace(0, 24, fr, nullptr);
++        HMODULE base = GetModuleHandleW(nullptr);
++        fprintf(stderr, "[wcw][recv#0] base=%p frames:", (void*)base);
++        for (unsigned short i = 0; i < n; i++) fprintf(stderr, " +0x%llX", (unsigned long long)((uintptr_t)fr[i] - (uintptr_t)base));
++        fprintf(stderr, "\n");
++    }
++#endif
++    rn++;
++
++    // Try to receive a message.
++    bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
++
++    // Check the queue to see if this thread should swap execution to another.
++    ultramodern::check_running_queue(PASS_RDRAM1);
++
++    if (rn <= 80) fprintf(stderr, "[wcw][recv#%d] -> %s\n", rn - 1, received ? "got msg" : "empty");
++    return received ? 0 : -1;
++}
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/audio.cpp	2026-07-07 15:35:26.736491600 -0400
++++ lib/N64ModernRuntime/ultramodern/src/audio.cpp	2026-07-11 22:08:45.468655600 -0400
+@@ -47,6 +47,20 @@
+ // (~50ms @ 22050 Hz) so the game builds real queue depth. Costs ~50ms audio latency.
+ float buffer_offset_frames = 6.0f;
+ 
++// [wcw2k] AI backpressure model (see ultramodern.hpp). Threshold must sit ABOVE the
++// buffer_offset_frames under-report below (6 VIs), so drivers that pace themselves by
++// osAiGetLength (WCW/Revenge) still build their ~6-VI depth before FULL ever asserts —
++// their behavior is unchanged. Drivers that pace by AI_STATUS_FULL (WM2000) bound the
++// host queue at ~8 VIs (~130ms) instead of growing it forever.
++bool ultramodern::is_audio_backlogged() {
++    if (audio_callbacks.get_frames_remaining == nullptr) {
++        return false;
++    }
++    uint32_t buffered_frames = (uint32_t)audio_callbacks.get_frames_remaining();
++    uint32_t frames_per_vi = sample_rate / 60;
++    return buffered_frames > 8 * frames_per_vi;
++}
++
+ // If there's ever any audio popping, check here first. Some games are very sensitive to
+ // the remaining sample count and reporting a number that's too high here can lead to issues.
+ // Reporting a number that's too low can lead to audio lag in some games.
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-07 15:35:26.735491600 -0400
-+++ lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-08 23:15:21.983607000 -0400
++++ lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-11 22:08:34.663531600 -0400
 @@ -57,6 +57,15 @@
  void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
  
@@ -692,13 +2082,748 @@
  void check_running_queue(RDRAM_ARG1);
  void run_next_thread_and_wait(RDRAM_ARG1);
  void resume_thread_and_wait(RDRAM_ARG OSThread* t);
+@@ -99,6 +108,12 @@
+ void set_audio_frequency(uint32_t freq);
+ void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
+ uint32_t get_remaining_audio_bytes();
++// [wcw2k] True when the host audio queue holds more than ~8 VIs of samples. Used by
++// osAiGetStatus to model the AI FIFO-full backpressure that paces AKI audio drivers
++// (WM2000's audio manager loops on `osAiGetStatus() & AI_STATUS_FULL` before generating;
++// without this it over-produces one fixed burst per frame message — unbounded queue
++// growth in healthy runs, 500 tasks/s free-run in message-clumped unattended sessions).
++bool is_audio_backlogged();
+ 
+ struct audio_callbacks_t {
+     using queue_samples_t = void(int16_t*, size_t);
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 15:35:30.405515800 -0400
 +++ lib/rt64/src/gbi/rt64_gbi.cpp	2026-07-07 22:58:34.879467800 -0400
-@@ -160,7 +160,13 @@
-     // 
-     //                  Length      Hash                    Known instances               
-     //     
+@@ -1,565 +1,589 @@
+-//
+-// RT64
+-//
+-
+-#include "rt64_gbi.h"
+-
+-#include <cassert>
+-#include <cinttypes>
+-
+-#include "rt64_gbi_extended.h"
+-#include "rt64_gbi_f3d.h"
+-#include "rt64_gbi_f3dgolden.h"
+-#include "rt64_gbi_f3dpd.h"
+-#include "rt64_gbi_f3dex.h"
+-#include "rt64_gbi_f3dex2.h"
+-#include "rt64_gbi_f3dwave.h"
+-#include "rt64_gbi_f3dzex2.h"
+-#include "rt64_gbi_l3dex2.h"
+-#include "rt64_gbi_rdp.h"
+-#include "rt64_gbi_s2dex.h"
+-#include "rt64_gbi_s2dex2.h"
+-
+-#define GBI_UNKNOWN_HASH_NUMB 0xFFFFFFFFFFFFFFFFULL
+-
+-namespace RT64 {
+-    // DisplayList
+-
+-    DisplayList::DisplayList() {
+-        w0 = w1 = 0;
+-    }
+-
+-    uint32_t DisplayList::p0(uint8_t pos, uint8_t bits) const {
+-        return ((w0 >> pos) & ((0x01 << bits) - 1));
+-    }
+-
+-    uint32_t DisplayList::p1(uint8_t pos, uint8_t bits) const {
+-        return ((w1 >> pos) & ((0x01 << bits) - 1));
+-    }
+-
+-    // ****************************************************************************************
+-    // * Database of known GBI versions.                                                      *
+-    // ****************************************************************************************
+-    // 
+-    //                  Constant                      Identifier                                   UCode                    LowP    NoN     ReJ     MVP     Point
+-    // 
+-    const GBIInstance   F3D_SDK_E                 = { "2.0D, 04-01-96 (F3D SDK 2.0E)",             GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_SDK_F                 = { "2.0D, 04-01-96 (F3D SDK 2.0F)",             GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_SDK_UNKNOWN_G         = { "2.0G, 09-30-96 (F3D SDK Unknown)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_SDK_UNKNOWN_H         = { "2.0H, 02-12-97 (F3D SDK Unknown)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_FIFO_SDK_E            = { "2.0D, 04-01-96 (F3D.fifo SDK 2.0E)",        GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_FIFO_SDK_F            = { "2.0D, 04-01-96 (F3D.fifo SDK 2.0F)",        GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_NON_SDK_E             = { "2.0D, 04-01-96 (F3D.NoN SDK 2.0E)",         GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_NON_SDK_UNKNOWN_D     = { "2.0D, 04-01-96 (F3D.NoN SDK Unknown)",      GBIUCode::Unknown,     { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_NON_SDK_UNKNOWN_G     = { "2.0G, 09-30-96 (F3D.NoN SDK Unknown)",      GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_NON_FIFO_SDK_E        = { "2.0D, 04-01-96 (F3D.NoN.fifo SDK 2.0E)",    GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_BC                    = { "2.0D, 04-01-96 (F3D Blast Corps)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_FB                    = { "2.0G, 09-30-96 (F3D Freaky Boy Proto)",     GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_SM64                  = { "2.0D, 04-01-96 (F3D.fifo SM64)",            GBIUCode::F3D,         { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3D_SM64_FINAL            = { "2.0H, 02-12-97 (F3D.fifo SM64 SH/iQue)",    GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_WAYNE                 = { "2.0D, 04-01-96 (F3D WG 3D Hockey)",         GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_GOLDEN                = { "SW Version: 2.0G, 09-30-96 (GE007)",        GBIUCode::F3DGOLDEN,   { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3D_PD                    = { "SW Version: Unknown (PD)",                  GBIUCode::F3DPD,       { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3D_WAVE                  = { "SW Version: 2.0D, 04-01-96 (Wave Race)",    GBIUCode::F3DWAVE,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_0_95                = { "F3DEX 0.95",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_0_95                = { "F3DLX 0.95",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_0_96                = { "F3DEX 0.96",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLP_0_96_REJ            = { "F3DLP 0.96.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_1_00                = { "F3DEX 1.00",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_1_21                = { "F3DEX 1.21",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3DEX_1_21_A              = { "F3DEX 1.21 (Variant)",                      GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_21                = { "F3DLX 1.21",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_21_REJ            = { "F3DLX 1.21.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } };
+-    const GBIInstance   F3DLP_1_21_REJ            = { "F3DLP 1.21.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_22                = { "F3DLX 1.22",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_1_23                = { "F3DEX 1.23",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3DEX_1_23_A              = { "F3DEX 1.23 (Variant)",                      GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_23                = { "F3DLX 1.23",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_23_A              = { "F3DLX 1.23 (Variant)",                      GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_23_REJ            = { "F3DLX 1.23.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_1_23_REJ_A          = { "F3DLX 1.23.Rej (Variant)",                  GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLP_1_23_REJ            = { "F3DLP 1.23.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DTEXA_1_23              = { "F3DTEX/A 1.23",                             GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_0_96            = { "F3DEX.NoN 0.96",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_00            = { "F3DEX.NoN 1.00",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_NON_1_00            = { "F3DLX.NoN 1.00",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_21            = { "F3DEX.NoN 1.21",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_21_A          = { "F3DEX.NoN 1.21 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_NON_1_21            = { "F3DLX.NoN 1.21",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_22            = { "F3DEX.NoN 1.22",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } };
+-    const GBIInstance   F3DEX_NON_1_22_A          = { "F3DEX.NoN 1.22 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_23            = { "F3DEX.NoN 1.23",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX_NON_1_23_A          = { "F3DEX.NoN 1.23 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_NON_1_23            = { "F3DLX.NoN 1.23",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX_NON_1_23_A          = { "F3DLX.NoN 1.23 (Variant)",                  GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_03          = { "F3DEX2.fifo 2.03",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_FIFO_2_03_REJ      = { "F3DLX2.fifo 2.03.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DFLX2_FIFO_2_03F_REJ    = { "F3DFLX2.fifo 2.03F.ReJ",                    GBIUCode::Unknown,     { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_04          = { "F3DEX2.fifo 2.04",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_04H         = { "F3DEX2.fifo 2.04H",                         GBIUCode::F3DEX2,      { false,  false,  false,  true,   false } };
+-    const GBIInstance   F3DEX2_FIFO_2_05          = { "F3DEX2.fifo 2.05",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3DEX2_FIFO_2_05_REJ      = { "F3DEX2.fifo 2.05.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_FIFO_2_05_REJ      = { "F3DLX2.fifo 2.05.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DAM2_FIFO_2_05          = { "F3DAM2.fifo 2.05",                          GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_06          = { "F3DEX2.fifo 2.06",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_06_REJ      = { "F3DEX2.fifo 2.06.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_FIFO_2_06_REJ      = { "F3DLX2.fifo 2.06.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_07          = { "F3DEX2.fifo 2.07",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3DEX2_FIFO_2_08          = { "F3DEX2.fifo 2.08",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   F3DEX2_FIFO_2_08_REJ      = { "F3DEX2.fifo 2.08.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_FIFO_2_08_REJ      = { "F3DLX2.fifo 2.08.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_08_CRUISN   = { "F3DEX2.fifo 2.08 (Cruis'n Exotica)",        GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_FIFO_2_08_PL       = { "F3DEX2.fifo 2.08 (POSLIGHT)",               GBIUCode::F3DEX2,      { false,  false,  false,  false,  true  } };
+-    const GBIInstance   F3DEX2_XBUS_2_05          = { "F3DEX2.xbus 2.05",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_XBUS_2_07          = { "F3DEX2.xbus 2.07",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_XBUS_2_07_REJ      = { "F3DLX2.xbus 2.07.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_XBUS_2_08          = { "F3DEX2.xbus 2.08",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DLX2_XBUS_2_08_REJ      = { "F3DLX2.xbus 2.08.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_03      = { "F3DEX2.NoN.fifo 2.03",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_04      = { "F3DEX2.NoN.fifo 2.04",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_05      = { "F3DEX2.NoN.fifo 2.05",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } };
+-    const GBIInstance   F3DEX2_NON_FIFO_ACCLAIM   = { "F3DEX2.NoN.fifo 2.05 (Acclaim)",            GBIUCode::Unknown,     { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_06      = { "F3DEX2.NoN.fifo 2.06",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_07      = { "F3DEX2.NoN.fifo 2.07",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_FIFO_2_08      = { "F3DEX2.NoN.fifo 2.08",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } };
+-    const GBIInstance   F3DEX2_NON_FIFO_2_08H     = { "F3DEX2.NoN.fifo 2.08H",                     GBIUCode::F3DEX2,      { false,  true,   false,  true,   false } };
+-    const GBIInstance   F3DEX2_NON_XBUS_2_06      = { "F3DEX2.NoN.xbus 2.06",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DEX2_NON_XBUS_2_08      = { "F3DEX2.NoN.xbus 2.08",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   F3DZEX2_NON_FIFO_2_06H    = { "F3DZEX2.NoN.fifo 2.06H",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  false } };
+-    const GBIInstance   F3DZEX2_NON_FIFO_2_08I    = { "F3DZEX2.NoN.fifo 2.08I",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  true  } };
+-    const GBIInstance   F3DZEX2_NON_FIFO_2_08J    = { "F3DZEX2.NoN.fifo 2.08J",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  true  } };
+-    const GBIInstance   S2D                       = { "2.0H, 02-12-97 (S2D)",                      GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2D_A                     = { "2.0H, 02-12-97 (S2D Variant)",              GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2D_FIFO                  = { "2.0H, 02-12-97 (S2D.fifo)",                 GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2D_FIFO_A                = { "2.0H, 02-12-97 (S2D.fifo Variant)",         GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX_1_03                = { "S2DEX 1.03",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX_1_05                = { "S2DEX 1.05",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX_1_06                = { "S2DEX 1.06",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX_1_07                = { "S2DEX 1.07",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } };
+-    const GBIInstance   S2DEX2_FIFO_2_04          = { "S2DEX2.fifo 2.04",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   S2DEX2_FIFO_2_05          = { "S2DEX2.fifo 2.05",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   S2DEX2_FIFO_2_05_SAFE     = { "S2DEX2.fifo 2.05 [Safe]",                   GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   S2DEX2_FIFO_2_06          = { "S2DEX2.fifo 2.06",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX2_FIFO_2_07          = { "S2DEX2.fifo 2.07",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX2_FIFO_2_08          = { "S2DEX2.fifo 2.08",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
+-    const GBIInstance   S2DEX2_XBUS_2_06          = { "S2DEX2.xbus 2.06",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   S2DEX2_XBUS_2_08          = { "S2DEX2.xbus 2.08",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3D_BC                    = { "2.0D, 04-01-96 (L3D Blast Corps)",          GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX_1_00                = { "L3DEX 1.00",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX_1_21                = { "L3DEX 1.21",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX_1_23                = { "L3DEX 1.23",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX_1_23_A              = { "L3DEX 1.23 (Variant)",                      GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX2_FIFO_2_05          = { "L3DEX2.fifo 2.05",                          GBIUCode::L3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX2_FIFO_ACCLAIM       = { "L3DEX2.fifo 2.05 (Acclaim)",                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   L3DEX2_FIFO_2_08          = { "L3DEX2.fifo 2.08",                          GBIUCode::L3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    const GBIInstance   ZSORTP_0_33               = { "ZSortp 0.33",                               GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
+-    
+-    // ****************************************************************************************
+-    // * Database of known UCode text and data segments.                                      *
+-    // ****************************************************************************************
+-    // 
+-    //                  Length      Hash                    Known instances               
+-    //     
 -    static std::array<GBISegment, 94> textSegments = {
+-            GBISegment{ 0x1408,     0x9C0926F5E466BE70ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x1400,     0x34EAA6E921BCF1B2ULL,  { &F3D_SDK_F, &F3D_SDK_UNKNOWN_G, &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
+-            GBISegment{ 0x1408,     0x3E05E9BBE814C700ULL,  { &F3D_FIFO_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x1428,     0x3343EA81180A60EAULL,  { &F3D_NON_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x13F8,     0xDF4FFEDA859B3E81ULL,  { &F3D_NON_SDK_UNKNOWN_D } }, // Needs confirmation.
+-            GBISegment{ 0x1418,     0x8E49F8C85F8D80CBULL,  { &F3D_NON_SDK_UNKNOWN_G } }, // Needs confirmation.
+-            GBISegment{ 0x1428,     0x048153ADD9701E33ULL,  { &F3D_NON_FIFO_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x1418,     0x4039FC02BC24A2F3ULL,  { &F3D_BC } }, // Needs confirmation.
+-            GBISegment{ 0x1408,     0xF50165C013FCB8A2ULL,  { &F3D_SM64 } },
+-            GBISegment{ 0x13F8,     0x7D8EB8BDCAE7DF81ULL,  { &F3D_SM64_FINAL, &F3D_FIFO_SDK_F, &F3D_FB } }, // Needs confirmation.
+-            GBISegment{ 0x1400,     0x2963554DB650E3B2ULL,  { &F3D_WAYNE } }, // Needs confirmation.
+-            GBISegment{ 0x1418,     0xAEBF9966DD0486DDULL,  { &F3D_PD } },
+-            GBISegment{ 0x1420,     0xEDA47A4C2B7E69F8ULL,  { &F3D_GOLDEN } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x547A4F6CEDE3C737ULL,  { &F3D_WAVE } }, // Needs confirmation.
+-            GBISegment{ 0x13E0,     0x28825EEF49EE29CFULL,  { &F3DEX_0_95 } }, // Needs confirmation.
+-            GBISegment{ 0x1410,     0xF1CC01CCC3607D27ULL,  { &F3DLX_0_95 } }, // Needs confirmation.
+-            GBISegment{ 0x13A0,     0x2DAE911B08F94FCFULL,  { &F3DEX_0_96, &F3DEX_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x1230,     0x5762888C48511FB7ULL,  { &F3DLP_0_96_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x9A7772037D709388ULL,  { &F3DEX_1_21, &F3DEX_1_23_A } },
+-            GBISegment{ 0x1430,     0x2BDA7A08A7E967D7ULL,  { &F3DEX_1_21_A } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x631C3DEB122D3D90ULL,  { &F3DLX_1_21, &F3DLX_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x13D0,     0x1BEA638E869B0195ULL,  { &F3DLX_1_21_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x13C8,     0x57AF272D794B1706ULL,  { &F3DLP_1_21_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x777E1616FEE67AEDULL,  { &F3DLX_1_22 } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0xAC03DE5B7B1E710FULL,  { &F3DEX_1_23 } },
+-            GBISegment{ 0x1430,     0x158A39AE852C6A07ULL,  { &F3DLX_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x13D0,     0xDE1E6BCF9EBFBAE9ULL,  { &F3DLX_1_23_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x13D0,     0xBDC34FD53910D3CCULL,  { &F3DLX_1_23_REJ_A } }, // Needs confirmation.
+-            GBISegment{ 0x13C8,     0x9CA29A9ADD6CFC0BULL,  { &F3DLP_1_23_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0xEE7CC90B5F7AB1D9ULL,  { &F3DTEXA_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x13C0,     0x600945CCAE7BFEC8ULL,  { &F3DEX_NON_0_96, &F3DEX_NON_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x13E8,     0x5FB61B550CB0D50AULL,  { &F3DLX_NON_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x454B7C0482C64F7FULL,  { &F3DEX_NON_1_21, &F3DEX_NON_1_22, &F3DEX_NON_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0xB9D3CD38EEE33417ULL,  { &F3DEX_NON_1_21_A } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0xB5535AFA4144CE0BULL,  { &F3DLX_NON_1_21, &F3DLX_NON_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x14B0,     0xEC5D1D98AEB0EFF6ULL,  { &F3DEX_NON_1_22_A } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0xA0132D3A6104A582ULL,  { &F3DEX_NON_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x1430,     0x81182AB598274EE9ULL,  { &F3DLX_NON_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x1370,     0xB15C4DE0C3534F47ULL,  { &F3DEX2_FIFO_2_03 } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0x4AEEB7B9E57E2D2EULL,  { &F3DLX2_FIFO_2_03_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0x2E8975DFB266FFA1ULL,  { &F3DFLX2_FIFO_2_03F_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0xF2931E7E69049A7AULL,  { &F3DEX2_FIFO_2_04 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x15C2462591E78D2BULL,  { &F3DEX2_FIFO_2_04H } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0xBA192DFA28437D3DULL,  { &F3DEX2_FIFO_2_05 } },
+-            GBISegment{ 0x1188,     0x462D273E7C98CAC7ULL,  { &F3DEX2_FIFO_2_05_REJ, &F3DEX2_FIFO_2_06_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0x87A4C67F1885E875ULL,  { &F3DLX2_FIFO_2_05_REJ, &F3DLX2_FIFO_2_06_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0x6F800A00CF591778ULL,  { &F3DAM2_FIFO_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x0B8FE363267ADCB4ULL,  { &F3DEX2_FIFO_2_06 } },
+-            GBISegment{ 0x1390,     0x8C1C9814E75E1B4BULL,  { &F3DEX2_FIFO_2_07 } },
+-            GBISegment{ 0x1390,     0xCF55FAE288BFE48DULL,  { &F3DEX2_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0xB9FBB8E71F72B596ULL,  { &F3DEX2_FIFO_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1188,     0x5235C026EC14B4FBULL,  { &F3DLX2_FIFO_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1378,     0xC2AE06B691610132ULL,  { &F3DEX2_FIFO_2_08_CRUISN } }, // Needs confirmation.
+-            GBISegment{ 0x1630,     0x4588323F6F7E7720ULL,  { &F3DEX2_FIFO_2_08_PL } },
+-            GBISegment{ 0x13A0,     0xD734CFD78F6CCD45ULL,  { &F3DEX2_XBUS_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x13A0,     0x0A4F40D3A58CB674ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+-            GBISegment{ 0x1198,     0x3B23DFF75831391CULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x13A0,     0xA7B96A2FC8C94E60ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x1198,     0xD5E0AABE069BA75CULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x1370,     0xCFCF197526613F82ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0xDF624201BC21895EULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x0856C0CA45B9ABC4ULL,  { &F3DEX2_NON_FIFO_2_05 } },
+-            GBISegment{ 0x1390,     0x07287E3B3682EFBBULL,  { &F3DEX2_NON_FIFO_ACCLAIM } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x150739719E00ADD0ULL,  { &F3DEX2_NON_FIFO_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0xA4686FA3C97AD3CCULL,  { &F3DEX2_NON_FIFO_2_07 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x4C12DAE0534D7135ULL,  { &F3DEX2_NON_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x35D374BE816BC7DAULL,  { &F3DEX2_NON_FIFO_2_08H } }, // Needs confirmation.
+-            GBISegment{ 0x13A0,     0xBA58701614D1A902ULL,  { &F3DEX2_NON_XBUS_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x13A0,     0x9BF34794D785E01BULL,  { &F3DEX2_NON_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x1390,     0x1A24186AD41D2568ULL,  { &F3DZEX2_NON_FIFO_2_06H } },
+-            GBISegment{ 0x1630,     0xF5EE0949F308CFE3ULL,  { &F3DZEX2_NON_FIFO_2_08I } },
+-            GBISegment{ 0x1630,     0x7502444D3DDBD4BFULL,  { &F3DZEX2_NON_FIFO_2_08J } },
+-            GBISegment{ 0xEA0,      0x76CC0F7EDCB9D6ADULL,  { &S2D } }, // Needs confirmation.
+-            GBISegment{ 0xEA0,      0x129C21833F31999DULL,  { &S2D_A } }, // Needs confirmation.
+-            GBISegment{ 0xED0,      0xE4910220BE1D53D7ULL,  { &S2D_FIFO } }, // Needs confirmation.
+-            GBISegment{ 0xED0,      0x56E22D6B0FE5BDEEULL,  { &S2D_FIFO_A } }, // Needs confirmation.
+-            GBISegment{ 0x17E0,     0x5034E426AA0213E3ULL,  { &S2DEX_1_03 } }, // Needs confirmation.
+-            GBISegment{ 0x17E0,     0x24E4DE8F087EEF34ULL,  { &S2DEX_1_05 } }, // Needs confirmation.
+-            GBISegment{ 0x17E0,     0xE3AABE6D3AA1DC84ULL,  { &S2DEX_1_06 } }, // Needs confirmation.
+-            GBISegment{ 0x17E0,     0x874A5915C0C4C8A8ULL,  { &S2DEX_1_07 } },
+-            GBISegment{ 0x18C0,     0xB524D27BED87DE3AULL,  { &S2DEX2_FIFO_2_04 } },
+-            GBISegment{ 0x18C0,     0x7F6DEA6A33FF67BDULL,  { &S2DEX2_FIFO_2_05, &S2DEX2_FIFO_2_06, &S2DEX2_FIFO_2_07 } },
+-            GBISegment{ 0x18C0,     0x252C09A4BBB2F9D3ULL,  { &S2DEX2_FIFO_2_05_SAFE } },
+-            GBISegment{ 0x18C0,     0x9300F34F3B438634ULL,  { &S2DEX2_FIFO_2_08 } },
+-            GBISegment{ 0x18D0,     0x1B84EB8DEF3DC2E7ULL,  { &S2DEX2_XBUS_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x18D0,     0xDD4DDB087A3CAC5EULL,  { &S2DEX2_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0xFA8,      0xCD640EC520D9F1E0ULL,  { &L3D_BC } }, // Needs confirmation.
+-            GBISegment{ 0xF68,      0x75A9F04BCF222D6AULL,  { &L3DEX_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0xFF0,      0xCFAEE316F8AF900CULL,  { &L3DEX_1_21, &L3DEX_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0xFF0,      0xC8D5E51F62D4F740ULL,  { &L3DEX_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x1190,     0xA2F9906594260FD4ULL,  { &L3DEX2_FIFO_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x1190,     0x019210E4F59B27C1ULL,  { &L3DEX2_FIFO_ACCLAIM } }, // Needs confirmation.
+-            GBISegment{ 0x1190,     0x60B6BA671EE6F1F6ULL,  { &L3DEX2_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x10B0,     0xE8028E4BC6529E6EULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
+-    };
+-
+-    static std::array<GBISegment, 105> dataSegments = {
+-            GBISegment{ 0x800,      0xEEB10D73400213B3ULL,  { &F3D_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x49651E384B48F694ULL,  { &F3D_SDK_F } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x1A736198F90E81C5ULL,  { &F3D_SDK_UNKNOWN_G } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x1798191D01F4D743ULL,  { &F3D_NON_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x40C193AB87AD57AFULL,  { &F3D_NON_SDK_UNKNOWN_D } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xECD447C4539036A6ULL,  { &F3D_NON_SDK_UNKNOWN_G } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xE6332A7A1278B05DULL,  { &F3D_NON_FIFO_SDK_E } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x6D784F182608475DULL,  { &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xD17ED94BB63DC244ULL,  { &F3D_BC } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x89E9CDC032C3F810ULL,  { &F3D_FB } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x276AC049785A7E70ULL,  { &F3D_SM64, &F3D_FIFO_SDK_E } },
+-            GBISegment{ 0x800,      0x880FCE853CE3E422ULL,  { &F3D_SM64_FINAL } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xF6D6112068370B46ULL,  { &F3D_FIFO_SDK_F } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x53AF11FA4205F4E7ULL,  { &F3D_WAYNE } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x72AD2373CEC74AA7ULL,  { &F3D_PD } },
+-            GBISegment{ 0x800,      0xB2152361A81ED3B0ULL,  { &F3D_GOLDEN } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x3E7A693EA9A18E45ULL,  { &F3D_WAVE } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x4BB61D72241EFD23ULL,  { &F3DEX_0_95 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x58641378A6D4FF0CULL,  { &F3DLX_0_95 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x1D53DE103B933358ULL,  { &F3DEX_0_96 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x478F5508A96A070BULL,  { &F3DLP_0_96_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xCE617F2A645340F4ULL,  { &F3DEX_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x4B5FDED20C137EC1ULL,  { &F3DEX_1_21, &F3DEX_1_21_A } },
+-            GBISegment{ 0x800,      0xCCF255DEB0FAA63DULL,  { &F3DLX_1_21 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x484C6940F5072C39ULL,  { &F3DLX_1_21_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x914E659B39FAE202ULL,  { &F3DLP_1_21_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x360E69EA3E9EB6B7ULL,  { &F3DLX_1_22 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x312E7A6E9F144186ULL,  { &F3DEX_NON_1_22_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x3828B4F75B0A0E6AULL,  { &F3DEX_1_23 } },
+-            GBISegment{ 0x800,      0x4A9D9C1BBFFEA48DULL,  { &F3DEX_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xEDDB46181FE78DE8ULL,  { &F3DLX_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x2773FDFC5E62C0B0ULL,  { &F3DLX_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x6BD0FEA8C97D3442ULL,  { &F3DLX_1_23_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x2A042AE973C2E3ABULL,  { &F3DLX_1_23_REJ_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x50D70B247E16A681ULL,  { &F3DLP_1_23_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x6BF03BD84C267741ULL,  { &F3DTEXA_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xC3131EA8EB614FE3ULL,  { &F3DEX_NON_0_96 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xD19BE2945518BDA8ULL,  { &F3DEX_NON_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x43B301361EBFD848ULL,  { &F3DLX_NON_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xEACD63EAECAF00B5ULL,  { &F3DEX_NON_1_21, &F3DEX_NON_1_21_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xA5E20037AB033BE2ULL,  { &F3DLX_NON_1_21 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x2A0468F401EEBDFAULL,  { &F3DEX_NON_1_22 } },
+-            GBISegment{ 0x800,      0xEC283C51058DB925ULL,  { &F3DEX_NON_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xCCB420ED1CC65F3FULL,  { &F3DEX_NON_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x9C7395BAB35E1E49ULL,  { &F3DLX_NON_1_23, } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x73678EC81B2D0D1FULL,  { &F3DLX_NON_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x3BF767E62B44ABC6ULL,  { &F3DEX2_FIFO_2_03 } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0xE967951D7760E73CULL,  { &F3DLX2_FIFO_2_03_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x3B0,      0x33FF4026CF6458F5ULL,  { &F3DFLX2_FIFO_2_03F_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xB2C65790C7A8D338ULL,  { &F3DEX2_FIFO_2_04 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x4484B6D3398C3B6CULL,  { &F3DEX2_FIFO_2_04H } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xF71B0A57D680F2B3ULL,  { &F3DEX2_FIFO_2_05 } },
+-            GBISegment{ 0x410,      0x9AB5B5144A3BD300ULL,  { &F3DEX2_FIFO_2_05_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0x7BF113F398B8301CULL,  { &F3DLX2_FIFO_2_05_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x430,      0xD7D5F81345FC5310ULL,  { &F3DAM2_FIFO_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xD4619CEDD1213E15ULL,  { &F3DEX2_FIFO_2_06 } },
+-            GBISegment{ 0x410,      0xD3135F48A08C1982ULL,  { &F3DEX2_FIFO_2_06_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0x47BA278DD7DB79EBULL,  { &F3DLX2_FIFO_2_06_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xF8649121FAB40A06ULL,  { &F3DEX2_FIFO_2_07 } },
+-            GBISegment{ 0x420,      0x3D4CAB9C82AD3772ULL,  { &F3DEX2_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0x14F9D11C0F58AFB5ULL,  { &F3DEX2_FIFO_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0x25A00931C3C2A573ULL,  { &F3DLX2_FIFO_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xD381B0139965EE5CULL,  { &F3DEX2_FIFO_2_08_CRUISN } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xB411ADC06FAA9D83ULL,  { &F3DEX2_FIFO_2_08_PL } },
+-            GBISegment{ 0x420,      0x58BA836DE5C3B968ULL,  { &F3DEX2_XBUS_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x1D0B2B02F7C09D84ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0xCE0DAA8259433956ULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x5FB335C8CDF86F48ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x410,      0x2869DC3116DEA560ULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x38FF0FE9D7CFBD34ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x2E3B70A49807BF89ULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xE57A61CA7770A4EAULL,  { &F3DEX2_NON_FIFO_2_05 } },
+-            GBISegment{ 0x420,      0xD62BDC3A200CBB35ULL,  { &F3DEX2_NON_FIFO_ACCLAIM } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xD415349186DC365CULL,  { &F3DEX2_NON_FIFO_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x806BEAF49F944E89ULL,  { &F3DEX2_NON_FIFO_2_07 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x3BE3FAD9073FEB78ULL,  { &F3DEX2_NON_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xE762274AB4B747CDULL,  { &F3DEX2_NON_FIFO_2_08H } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x3E29DC0570E8B835ULL,  { &F3DEX2_NON_XBUS_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0x8309F513B20C9040ULL,  { &F3DEX2_NON_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x420,      0xE3E5C20BC750105EULL,  { &F3DZEX2_NON_FIFO_2_06H } },
+-            GBISegment{ 0x420,      0x002D7FA254ABD8E7ULL,  { &F3DZEX2_NON_FIFO_2_08I } },
+-            GBISegment{ 0x420,      0x6069A2803CB39E66ULL,  { &F3DZEX2_NON_FIFO_2_08J } },
+-            GBISegment{ 0xFC0,      0xDC8A6B7535C3EC67ULL,  { &S2D, &S2D_A } }, // Needs confirmation.
+-            GBISegment{ 0xFC0,      0x6255273A8C5887F3ULL,  { &S2D_FIFO, &S2D_FIFO_A } }, // Needs confirmation.
+-            GBISegment{ 0x3C0,      0x59EE4D449CA1F9AFULL,  { &S2DEX_1_03 } }, // Needs confirmation.
+-            GBISegment{ 0x3C0,      0x14A890EC7B06F2E9ULL,  { &S2DEX_1_05 } }, // Needs confirmation.
+-            GBISegment{ 0x3C0,      0x7A9811CF7E7FCCCFULL,  { &S2DEX_1_06 } }, // Needs confirmation.
+-            GBISegment{ 0x3C0,      0x2018F33CBC3E2818ULL,  { &S2DEX_1_07 } },
+-            GBISegment{ 0x390,      0xB3108E4928CB6B1DULL,  { &S2DEX2_FIFO_2_04 } },
+-            GBISegment{ 0x390,      0x47829093527F366BULL,  { &S2DEX2_FIFO_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x390,      0x01DE3936615B8C9CULL,  { &S2DEX2_FIFO_2_05_SAFE } },
+-            GBISegment{ 0x390,      0x507670688A6E0671ULL,  { &S2DEX2_FIFO_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x390,      0xB0FA15F7CFBB1978ULL,  { &S2DEX2_FIFO_2_07 } }, // Needs confirmation.
+-            GBISegment{ 0x390,      0x50EF0DFBD3A8CD0FULL,  { &S2DEX2_FIFO_2_08 } },
+-            GBISegment{ 0x390,      0x123C6688307483B6ULL,  { &S2DEX2_XBUS_2_06 } }, // Needs confirmation.
+-            GBISegment{ 0x390,      0x4143792286C20CFFULL,  { &S2DEX2_XBUS_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x4B2D1A8C46895B0DULL,  { &L3D_BC } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0xD15737A2A52F0B12ULL,  { &L3DEX_1_00 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x5C189B2C6243EB6DULL,  { &L3DEX_1_21 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x880EF9B9011CB11EULL,  { &L3DEX_1_23 } }, // Needs confirmation.
+-            GBISegment{ 0x800,      0x67315143B3DE852EULL,  { &L3DEX_1_23_A } }, // Needs confirmation.
+-            GBISegment{ 0x3F0,      0x58F659DEBA493C69ULL,  { &L3DEX2_FIFO_2_05 } }, // Needs confirmation.
+-            GBISegment{ 0x3F0,      0x772E4F4BD7F82DEFULL,  { &L3DEX2_FIFO_ACCLAIM } }, // Needs confirmation.
+-            GBISegment{ 0x3F0,      0xE261C98A63863DB4ULL,  { &L3DEX2_FIFO_2_08 } }, // Needs confirmation.
+-            GBISegment{ 0x400,      0x8F5D64011662220CULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
+-    };
+-
+-    static bool textAndDataSegmentsSorted = false;
+-
+-    // GBIManager
+-
+-    GBIManager::GBIManager() {
+-        GBI_EXTENDED::initialize();
+-
+-        if (!textAndDataSegmentsSorted) {
+-            std::sort(textSegments.begin(), textSegments.end());
+-            std::sort(dataSegments.begin(), dataSegments.end());
+-            textAndDataSegmentsSorted = true;
+-        }
+-    }
+-
+-    GBIManager::~GBIManager() {
+-        // Does nothing.
+-    }
+-    
+-    GBI *GBIManager::getGBIForRDP() {
+-        GBI &gbi = gbiCache[uint32_t(GBIUCode::RDP)];
+-        if (gbi.ucode == GBIUCode::Unknown) {
+-            gbi.ucode = GBIUCode::RDP;
+-            GBI_RDP::setup(&gbi, false);
+-        }
+-
+-        return &gbi;
+-    }
+-    
+-    GBI *GBIManager::getGBIForUCode(uint8_t *RDRAM, uint32_t textAddress, uint32_t dataAddress) {
+-        assert(RDRAM != nullptr);
+-
+-        int32_t textSegmentIndex = -1;
+-        uint8_t *rdramCursor = &RDRAM[textAddress];
+-        uint32_t rdramHashed = 0;
+-        uint64_t rdramHash = 0;
+-        XXH3_state_t xxh3;
+-        XXH3_64bits_reset(&xxh3);
+-
+-        auto hashSegment = [&](uint32_t index, const GBISegment &gbiSegment, int32_t &resultIndex) {
+-            if (gbiSegment.hashLength > rdramHashed) {
+-                const uint32_t rdramToHash = gbiSegment.hashLength - rdramHashed;
+-                XXH3_64bits_update(&xxh3, rdramCursor, rdramToHash);
+-                rdramHash = XXH3_64bits_digest(&xxh3);
+-                rdramCursor += rdramToHash;
+-                rdramHashed += rdramToHash;
+-            }
+-
+-            if (rdramHash == gbiSegment.hashValue) {
+-                resultIndex = int32_t(index);
+-            }
+-
+-            // If we used an unknown value in the database, print the hash.
+-            if (gbiSegment.hashValue == GBI_UNKNOWN_HASH_NUMB) {
+-                fprintf(stdout, "HASH: 0x%016" PRIX64 "ULL SIZE: 0x%X\n", rdramHash, rdramHashed);
+-            }
+-        };
+-
+-        for (uint32_t i = 0; i < textSegments.size(); i++) {
+-            hashSegment(i, textSegments[i], textSegmentIndex);
+-        }
+-
+-        int32_t dataSegmentIndex = -1;
+-        XXH3_64bits_reset(&xxh3);
+-        rdramCursor = &RDRAM[dataAddress];
+-        rdramHashed = 0;
+-        rdramHash = 0;
+-        for (uint32_t i = 0; i < dataSegments.size(); i++) {
+-            hashSegment(i, dataSegments[i], dataSegmentIndex);
+-        }
+-
+-        if (textSegmentIndex < 0 || dataSegmentIndex < 0) {
+-            fprintf(stderr, "Unable to find a matching GBI in the current database. This game is not supported in HLE.\n");
+-            deduceGBIInformation(RDRAM, textAddress, dataAddress);
+-            return nullptr;
+-        }
+-
+-        // Search for the first intersection available between both segments.
+-        const GBISegment &textSegment = textSegments[textSegmentIndex];
+-        const GBISegment &dataSegment = dataSegments[dataSegmentIndex];
+-        const GBIInstance *matchingInstance = nullptr;
+-        for (const GBIInstance *textInstance : textSegment.instances) {
+-            for (const GBIInstance *dataInstance : dataSegment.instances) {
+-                if (textInstance == dataInstance) {
+-                    matchingInstance = dataInstance;
+-                    break;
+-                }
+-            }
+-        }
+-
+-        if (matchingInstance == nullptr) {
+-            fprintf(stderr, "Unable to find a GBI that is shared between the text and data segment. Is the GBI database configured incorrectly?\n");
+-            return nullptr;
+-        }
+-
+-        // [wcw] DIAGNOSTIC: report which GBI the ucode hash matched.
+-        fprintf(stderr, "[wcw][gbi] matched ucode: name='%s' enum=%d (text=0x%X data=0x%X)\n",
+-            matchingInstance->name, (int)matchingInstance->ucode, textAddress, dataAddress);
+-
+-        GBI &gbi = gbiCache[uint32_t(matchingInstance->ucode)];
+-        if (gbi.ucode == GBIUCode::Unknown) {
+-            gbi.ucode = matchingInstance->ucode;
+-
+-            // Common RDP functions.
+-            GBI_RDP::setup(&gbi, true);
+-
+-            switch (gbi.ucode) {
+-            case GBIUCode::RDP:
+-                break;
+-            case GBIUCode::F3D:
+-                GBI_F3D::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DGOLDEN:
+-                GBI_F3DGOLDEN::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DPD:
+-                GBI_F3DPD::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DWAVE:
+-                GBI_F3DWAVE::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DEX:
+-                GBI_F3DEX::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DEX2:
+-                GBI_F3DEX2::setup(&gbi);
+-                break;
+-            case GBIUCode::F3DZEX2:
+-                GBI_F3DZEX2::setup(&gbi);
+-                break;
+-            case GBIUCode::S2DEX:
+-                GBI_S2DEX::setup(&gbi);
+-                break;
+-            case GBIUCode::S2DEX2:
+-                GBI_S2DEX2::setup(&gbi);
+-                break;
+-            case GBIUCode::L3DEX2:
+-                GBI_L3DEX2::setup(&gbi);
+-                break;
+-            default:
+-                assert(false && "Unknown UCode.");
+-                break;
+-            }
+-        }
+-
+-        // Update the cached GBI to use the instance's flags.
+-        gbi.flags = matchingInstance->flags;
+-
+-        return &gbi;
+-    }
+-
+-    void GBIManager::deduceGBIInformation(uint8_t *RDRAM, uint32_t textAddress, uint32_t dataAddress) {
+-        const uint8_t rspPattern[] = "RSP";
+-        uint8_t dataSegmentBytes[0x800];
+-        uint8_t *dataSegmentBytesEnd = dataSegmentBytes + std::size(dataSegmentBytes);
+-        for (size_t i = 0; i < std::size(dataSegmentBytes); i++) {
+-            dataSegmentBytes[i] = RDRAM[(dataAddress + i) ^ 0x3];
+-        }
+-
+-        const uint8_t *searchResult = std::search(dataSegmentBytes, dataSegmentBytesEnd, rspPattern, rspPattern + std::size(rspPattern) - 1);
+-        if (searchResult != dataSegmentBytesEnd) {
+-            uint32_t validChars = 0;
+-            while (searchResult[validChars] > 0x0A) {
+-                validChars++;
+-            }
+-
+-            if (validChars > 0) {
+-                const uint8_t *searchResultEnd = searchResult + validChars;
+-                fprintf(stderr, "Detected name in data: %.*s\n", validChars, searchResult);
+-
+-                const uint8_t f3dexPattern[] = "F3DEX";
+-                const uint8_t s2dexPattern[] = "S2DEX";
+-                const uint8_t twoPointPattern[] = "2.";
+-                const uint8_t *f3dexResult = std::search(searchResult, searchResultEnd, f3dexPattern, f3dexPattern + std::size(f3dexPattern) - 1);
+-                const uint8_t *twoPointResult = std::search(searchResult, searchResultEnd, twoPointPattern, twoPointPattern + std::size(twoPointPattern) - 1);
+-                if ((f3dexResult != searchResultEnd) && (twoPointResult != searchResultEnd)) {
+-                    const uint32_t lastOverlay = *reinterpret_cast<const uint32_t *>(&RDRAM[dataAddress + 0x410]);
+-                    const uint16_t lastOverlaySize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x414) ^ 2]);
+-                    const uint16_t estimatedDataSize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x380) ^ 2]);
+-                    const uint32_t textSize = lastOverlay + lastOverlaySize + 1;
+-                    fprintf(stderr, "Detected text size is 0x%X\n", textSize);
+-                    fprintf(stderr, "Estimated data size is 0x%X\n", estimatedDataSize);
+-                }
+-
+-                const uint8_t *s2dexResult = std::search(searchResult, searchResultEnd, s2dexPattern, s2dexPattern + std::size(s2dexPattern) - 1);
+-                if ((s2dexResult != searchResultEnd) && (twoPointResult != searchResultEnd)) {
+-                    const uint32_t lastOverlay = *reinterpret_cast<const uint32_t *>(&RDRAM[dataAddress + 0x31C]);
+-                    const uint16_t lastOverlaySize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x320) ^ 2]);
+-                    const uint32_t textSize = lastOverlay + lastOverlaySize + 1;
+-                    fprintf(stderr, "Detected text size is 0x%X\n", textSize);
+-                }
+-            }
+-        }
+-    }
+-
+-    GBIFunction GBIManager::getExtendedFunction() const {
+-        return &GBI_EXTENDED::extendedOp;
+-    }
++//
++// RT64
++//
++
++#include "rt64_gbi.h"
++
++#include <cassert>
++#include <cinttypes>
++
++#include "rt64_gbi_extended.h"
++#include "rt64_gbi_f3d.h"
++#include "rt64_gbi_f3dgolden.h"
++#include "rt64_gbi_f3dpd.h"
++#include "rt64_gbi_f3dex.h"
++#include "rt64_gbi_f3dex2.h"
++#include "rt64_gbi_f3dwave.h"
++#include "rt64_gbi_f3dzex2.h"
++#include "rt64_gbi_l3dex2.h"
++#include "rt64_gbi_rdp.h"
++#include "rt64_gbi_s2dex.h"
++#include "rt64_gbi_s2dex2.h"
++
++#define GBI_UNKNOWN_HASH_NUMB 0xFFFFFFFFFFFFFFFFULL
++
++namespace RT64 {
++    // DisplayList
++
++    DisplayList::DisplayList() {
++        w0 = w1 = 0;
++    }
++
++    uint32_t DisplayList::p0(uint8_t pos, uint8_t bits) const {
++        return ((w0 >> pos) & ((0x01 << bits) - 1));
++    }
++
++    uint32_t DisplayList::p1(uint8_t pos, uint8_t bits) const {
++        return ((w1 >> pos) & ((0x01 << bits) - 1));
++    }
++
++    // ****************************************************************************************
++    // * Database of known GBI versions.                                                      *
++    // ****************************************************************************************
++    // 
++    //                  Constant                      Identifier                                   UCode                    LowP    NoN     ReJ     MVP     Point
++    // 
++    const GBIInstance   F3D_SDK_E                 = { "2.0D, 04-01-96 (F3D SDK 2.0E)",             GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_SDK_F                 = { "2.0D, 04-01-96 (F3D SDK 2.0F)",             GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_SDK_UNKNOWN_G         = { "2.0G, 09-30-96 (F3D SDK Unknown)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_SDK_UNKNOWN_H         = { "2.0H, 02-12-97 (F3D SDK Unknown)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_FIFO_SDK_E            = { "2.0D, 04-01-96 (F3D.fifo SDK 2.0E)",        GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_FIFO_SDK_F            = { "2.0D, 04-01-96 (F3D.fifo SDK 2.0F)",        GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_NON_SDK_E             = { "2.0D, 04-01-96 (F3D.NoN SDK 2.0E)",         GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_NON_SDK_UNKNOWN_D     = { "2.0D, 04-01-96 (F3D.NoN SDK Unknown)",      GBIUCode::Unknown,     { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_NON_SDK_UNKNOWN_G     = { "2.0G, 09-30-96 (F3D.NoN SDK Unknown)",      GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_NON_FIFO_SDK_E        = { "2.0D, 04-01-96 (F3D.NoN.fifo SDK 2.0E)",    GBIUCode::F3D,         { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_BC                    = { "2.0D, 04-01-96 (F3D Blast Corps)",          GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_FB                    = { "2.0G, 09-30-96 (F3D Freaky Boy Proto)",     GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_SM64                  = { "2.0D, 04-01-96 (F3D.fifo SM64)",            GBIUCode::F3D,         { false,  false,  false,  false,  false } };
++    const GBIInstance   F3D_SM64_FINAL            = { "2.0H, 02-12-97 (F3D.fifo SM64 SH/iQue)",    GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_WAYNE                 = { "2.0D, 04-01-96 (F3D WG 3D Hockey)",         GBIUCode::F3D,         { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_GOLDEN                = { "SW Version: 2.0G, 09-30-96 (GE007)",        GBIUCode::F3DGOLDEN,   { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3D_PD                    = { "SW Version: Unknown (PD)",                  GBIUCode::F3DPD,       { false,  false,  false,  false,  false } };
++    const GBIInstance   F3D_WAVE                  = { "SW Version: 2.0D, 04-01-96 (Wave Race)",    GBIUCode::F3DWAVE,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_0_95                = { "F3DEX 0.95",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_0_95                = { "F3DLX 0.95",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_0_96                = { "F3DEX 0.96",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLP_0_96_REJ            = { "F3DLP 0.96.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_1_00                = { "F3DEX 1.00",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_1_21                = { "F3DEX 1.21",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } };
++    const GBIInstance   F3DEX_1_21_A              = { "F3DEX 1.21 (Variant)",                      GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_21                = { "F3DLX 1.21",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_21_REJ            = { "F3DLX 1.21.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } };
++    const GBIInstance   F3DLP_1_21_REJ            = { "F3DLP 1.21.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_22                = { "F3DLX 1.22",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_1_23                = { "F3DEX 1.23",                                GBIUCode::F3DEX,       { false,  false,  false,  false,  false } };
++    const GBIInstance   F3DEX_1_23_A              = { "F3DEX 1.23 (Variant)",                      GBIUCode::F3DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_23                = { "F3DLX 1.23",                                GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_23_A              = { "F3DLX 1.23 (Variant)",                      GBIUCode::F3DEX,       { true,   false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_23_REJ            = { "F3DLX 1.23.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_1_23_REJ_A          = { "F3DLX 1.23.Rej (Variant)",                  GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLP_1_23_REJ            = { "F3DLP 1.23.Rej",                            GBIUCode::F3DEX,       { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DTEXA_1_23              = { "F3DTEX/A 1.23",                             GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_0_96            = { "F3DEX.NoN 0.96",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_00            = { "F3DEX.NoN 1.00",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_NON_1_00            = { "F3DLX.NoN 1.00",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_21            = { "F3DEX.NoN 1.21",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_21_A          = { "F3DEX.NoN 1.21 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_NON_1_21            = { "F3DLX.NoN 1.21",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_22            = { "F3DEX.NoN 1.22",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } };
++    const GBIInstance   F3DEX_NON_1_22_A          = { "F3DEX.NoN 1.22 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_23            = { "F3DEX.NoN 1.23",                            GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX_NON_1_23_A          = { "F3DEX.NoN 1.23 (Variant)",                  GBIUCode::F3DEX,       { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_NON_1_23            = { "F3DLX.NoN 1.23",                            GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX_NON_1_23_A          = { "F3DLX.NoN 1.23 (Variant)",                  GBIUCode::F3DEX,       { true,   true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_03          = { "F3DEX2.fifo 2.03",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_FIFO_2_03_REJ      = { "F3DLX2.fifo 2.03.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DFLX2_FIFO_2_03F_REJ    = { "F3DFLX2.fifo 2.03F.ReJ",                    GBIUCode::Unknown,     { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_04          = { "F3DEX2.fifo 2.04",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_04H         = { "F3DEX2.fifo 2.04H",                         GBIUCode::F3DEX2,      { false,  false,  false,  true,   false } };
++    const GBIInstance   F3DEX2_FIFO_2_05          = { "F3DEX2.fifo 2.05",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   F3DEX2_FIFO_2_05_REJ      = { "F3DEX2.fifo 2.05.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_FIFO_2_05_REJ      = { "F3DLX2.fifo 2.05.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DAM2_FIFO_2_05          = { "F3DAM2.fifo 2.05",                          GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_06          = { "F3DEX2.fifo 2.06",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_06_REJ      = { "F3DEX2.fifo 2.06.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_FIFO_2_06_REJ      = { "F3DLX2.fifo 2.06.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_07          = { "F3DEX2.fifo 2.07",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   F3DEX2_FIFO_2_08          = { "F3DEX2.fifo 2.08",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   F3DEX2_FIFO_2_08_REJ      = { "F3DEX2.fifo 2.08.Rej",                      GBIUCode::F3DEX2,      { false,  false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_FIFO_2_08_REJ      = { "F3DLX2.fifo 2.08.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_08_CRUISN   = { "F3DEX2.fifo 2.08 (Cruis'n Exotica)",        GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_FIFO_2_08_PL       = { "F3DEX2.fifo 2.08 (POSLIGHT)",               GBIUCode::F3DEX2,      { false,  false,  false,  false,  true  } };
++    const GBIInstance   F3DEX2_XBUS_2_05          = { "F3DEX2.xbus 2.05",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_XBUS_2_07          = { "F3DEX2.xbus 2.07",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_XBUS_2_07_REJ      = { "F3DLX2.xbus 2.07.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_XBUS_2_08          = { "F3DEX2.xbus 2.08",                          GBIUCode::F3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DLX2_XBUS_2_08_REJ      = { "F3DLX2.xbus 2.08.Rej",                      GBIUCode::F3DEX2,      { true,   false,  true,   false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_03      = { "F3DEX2.NoN.fifo 2.03",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_04      = { "F3DEX2.NoN.fifo 2.04",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_05      = { "F3DEX2.NoN.fifo 2.05",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } };
++    const GBIInstance   F3DEX2_NON_FIFO_ACCLAIM   = { "F3DEX2.NoN.fifo 2.05 (Acclaim)",            GBIUCode::Unknown,     { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_06      = { "F3DEX2.NoN.fifo 2.06",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_07      = { "F3DEX2.NoN.fifo 2.07",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_FIFO_2_08      = { "F3DEX2.NoN.fifo 2.08",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } };
++    const GBIInstance   F3DEX2_NON_FIFO_2_08H     = { "F3DEX2.NoN.fifo 2.08H",                     GBIUCode::F3DEX2,      { false,  true,   false,  true,   false } };
++    const GBIInstance   F3DEX2_NON_XBUS_2_06      = { "F3DEX2.NoN.xbus 2.06",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DEX2_NON_XBUS_2_08      = { "F3DEX2.NoN.xbus 2.08",                      GBIUCode::F3DEX2,      { false,  true,   false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   F3DZEX2_NON_FIFO_2_06H    = { "F3DZEX2.NoN.fifo 2.06H",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  false } };
++    const GBIInstance   F3DZEX2_NON_FIFO_2_08I    = { "F3DZEX2.NoN.fifo 2.08I",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  true  } };
++    const GBIInstance   F3DZEX2_NON_FIFO_2_08J    = { "F3DZEX2.NoN.fifo 2.08J",                    GBIUCode::F3DZEX2,     { false,  true,   false,  false,  true  } };
++    const GBIInstance   S2D                       = { "2.0H, 02-12-97 (S2D)",                      GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2D_A                     = { "2.0H, 02-12-97 (S2D Variant)",              GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2D_FIFO                  = { "2.0H, 02-12-97 (S2D.fifo)",                 GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2D_FIFO_A                = { "2.0H, 02-12-97 (S2D.fifo Variant)",         GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX_1_03                = { "S2DEX 1.03",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX_1_05                = { "S2DEX 1.05",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX_1_06                = { "S2DEX 1.06",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX_1_07                = { "S2DEX 1.07",                                GBIUCode::S2DEX,       { false,  false,  false,  false,  false } };
++    const GBIInstance   S2DEX2_FIFO_2_04          = { "S2DEX2.fifo 2.04",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   S2DEX2_FIFO_2_05          = { "S2DEX2.fifo 2.05",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   S2DEX2_FIFO_2_05_SAFE     = { "S2DEX2.fifo 2.05 [Safe]",                   GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   S2DEX2_FIFO_2_06          = { "S2DEX2.fifo 2.06",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX2_FIFO_2_07          = { "S2DEX2.fifo 2.07",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX2_FIFO_2_08          = { "S2DEX2.fifo 2.08",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } };
++    const GBIInstance   S2DEX2_XBUS_2_06          = { "S2DEX2.xbus 2.06",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   S2DEX2_XBUS_2_08          = { "S2DEX2.xbus 2.08",                          GBIUCode::S2DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3D_BC                    = { "2.0D, 04-01-96 (L3D Blast Corps)",          GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX_1_00                = { "L3DEX 1.00",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX_1_21                = { "L3DEX 1.21",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX_1_23                = { "L3DEX 1.23",                                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX_1_23_A              = { "L3DEX 1.23 (Variant)",                      GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX2_FIFO_2_05          = { "L3DEX2.fifo 2.05",                          GBIUCode::L3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX2_FIFO_ACCLAIM       = { "L3DEX2.fifo 2.05 (Acclaim)",                GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   L3DEX2_FIFO_2_08          = { "L3DEX2.fifo 2.08",                          GBIUCode::L3DEX2,      { false,  false,  false,  false,  false } }; // Needs confirmation.
++    const GBIInstance   ZSORTP_0_33               = { "ZSortp 0.33",                               GBIUCode::Unknown,     { false,  false,  false,  false,  false } }; // Needs confirmation.
++    
++    // ****************************************************************************************
++    // * Database of known UCode text and data segments.                                      *
++    // ****************************************************************************************
++    // 
++    //                  Length      Hash                    Known instances               
++    //     
 +    static std::array<GBISegment, 96> textSegments = {
 +            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" (AKI 1999): bytes past 0x1000 of the
 +            // text are VOLATILE at runtime (hashed differently seconds apart mid-run —
@@ -706,43 +2831,290 @@
 +            // prefix. (The tables are std::sort'ed by length at init, so cumulative
 +            // hashing hits the 0x1000 checkpoint first regardless of position here.)
 +            GBISegment{ 0x1000,     0x748B4244A299527EULL,  { &F3DLX2_XBUS_2_08_REJ } },
-             GBISegment{ 0x1408,     0x9C0926F5E466BE70ULL,  { &F3D_SDK_E } }, // Needs confirmation.
-             GBISegment{ 0x1400,     0x34EAA6E921BCF1B2ULL,  { &F3D_SDK_F, &F3D_SDK_UNKNOWN_G, &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
-             GBISegment{ 0x1408,     0x3E05E9BBE814C700ULL,  { &F3D_FIFO_SDK_E } }, // Needs confirmation.
-@@ -219,6 +225,11 @@
-             GBISegment{ 0x13A0,     0x0A4F40D3A58CB674ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
-             GBISegment{ 0x1198,     0x3B23DFF75831391CULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
-             GBISegment{ 0x13A0,     0xA7B96A2FC8C94E60ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x1408,     0x9C0926F5E466BE70ULL,  { &F3D_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x1400,     0x34EAA6E921BCF1B2ULL,  { &F3D_SDK_F, &F3D_SDK_UNKNOWN_G, &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
++            GBISegment{ 0x1408,     0x3E05E9BBE814C700ULL,  { &F3D_FIFO_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x1428,     0x3343EA81180A60EAULL,  { &F3D_NON_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x13F8,     0xDF4FFEDA859B3E81ULL,  { &F3D_NON_SDK_UNKNOWN_D } }, // Needs confirmation.
++            GBISegment{ 0x1418,     0x8E49F8C85F8D80CBULL,  { &F3D_NON_SDK_UNKNOWN_G } }, // Needs confirmation.
++            GBISegment{ 0x1428,     0x048153ADD9701E33ULL,  { &F3D_NON_FIFO_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x1418,     0x4039FC02BC24A2F3ULL,  { &F3D_BC } }, // Needs confirmation.
++            GBISegment{ 0x1408,     0xF50165C013FCB8A2ULL,  { &F3D_SM64 } },
++            GBISegment{ 0x13F8,     0x7D8EB8BDCAE7DF81ULL,  { &F3D_SM64_FINAL, &F3D_FIFO_SDK_F, &F3D_FB } }, // Needs confirmation.
++            GBISegment{ 0x1400,     0x2963554DB650E3B2ULL,  { &F3D_WAYNE } }, // Needs confirmation.
++            GBISegment{ 0x1418,     0xAEBF9966DD0486DDULL,  { &F3D_PD } },
++            GBISegment{ 0x1420,     0xEDA47A4C2B7E69F8ULL,  { &F3D_GOLDEN } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x547A4F6CEDE3C737ULL,  { &F3D_WAVE } }, // Needs confirmation.
++            GBISegment{ 0x13E0,     0x28825EEF49EE29CFULL,  { &F3DEX_0_95 } }, // Needs confirmation.
++            GBISegment{ 0x1410,     0xF1CC01CCC3607D27ULL,  { &F3DLX_0_95 } }, // Needs confirmation.
++            GBISegment{ 0x13A0,     0x2DAE911B08F94FCFULL,  { &F3DEX_0_96, &F3DEX_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x1230,     0x5762888C48511FB7ULL,  { &F3DLP_0_96_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x9A7772037D709388ULL,  { &F3DEX_1_21, &F3DEX_1_23_A } },
++            GBISegment{ 0x1430,     0x2BDA7A08A7E967D7ULL,  { &F3DEX_1_21_A } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x631C3DEB122D3D90ULL,  { &F3DLX_1_21, &F3DLX_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x13D0,     0x1BEA638E869B0195ULL,  { &F3DLX_1_21_REJ } }, // Needs confirmation.
++            GBISegment{ 0x13C8,     0x57AF272D794B1706ULL,  { &F3DLP_1_21_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x777E1616FEE67AEDULL,  { &F3DLX_1_22 } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0xAC03DE5B7B1E710FULL,  { &F3DEX_1_23 } },
++            GBISegment{ 0x1430,     0x158A39AE852C6A07ULL,  { &F3DLX_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x13D0,     0xDE1E6BCF9EBFBAE9ULL,  { &F3DLX_1_23_REJ } }, // Needs confirmation.
++            GBISegment{ 0x13D0,     0xBDC34FD53910D3CCULL,  { &F3DLX_1_23_REJ_A } }, // Needs confirmation.
++            GBISegment{ 0x13C8,     0x9CA29A9ADD6CFC0BULL,  { &F3DLP_1_23_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0xEE7CC90B5F7AB1D9ULL,  { &F3DTEXA_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x13C0,     0x600945CCAE7BFEC8ULL,  { &F3DEX_NON_0_96, &F3DEX_NON_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x13E8,     0x5FB61B550CB0D50AULL,  { &F3DLX_NON_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x454B7C0482C64F7FULL,  { &F3DEX_NON_1_21, &F3DEX_NON_1_22, &F3DEX_NON_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0xB9D3CD38EEE33417ULL,  { &F3DEX_NON_1_21_A } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0xB5535AFA4144CE0BULL,  { &F3DLX_NON_1_21, &F3DLX_NON_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x14B0,     0xEC5D1D98AEB0EFF6ULL,  { &F3DEX_NON_1_22_A } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0xA0132D3A6104A582ULL,  { &F3DEX_NON_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x1430,     0x81182AB598274EE9ULL,  { &F3DLX_NON_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x1370,     0xB15C4DE0C3534F47ULL,  { &F3DEX2_FIFO_2_03 } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0x4AEEB7B9E57E2D2EULL,  { &F3DLX2_FIFO_2_03_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0x2E8975DFB266FFA1ULL,  { &F3DFLX2_FIFO_2_03F_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0xF2931E7E69049A7AULL,  { &F3DEX2_FIFO_2_04 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x15C2462591E78D2BULL,  { &F3DEX2_FIFO_2_04H } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0xBA192DFA28437D3DULL,  { &F3DEX2_FIFO_2_05 } },
++            GBISegment{ 0x1188,     0x462D273E7C98CAC7ULL,  { &F3DEX2_FIFO_2_05_REJ, &F3DEX2_FIFO_2_06_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0x87A4C67F1885E875ULL,  { &F3DLX2_FIFO_2_05_REJ, &F3DLX2_FIFO_2_06_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0x6F800A00CF591778ULL,  { &F3DAM2_FIFO_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x0B8FE363267ADCB4ULL,  { &F3DEX2_FIFO_2_06 } },
++            GBISegment{ 0x1390,     0x8C1C9814E75E1B4BULL,  { &F3DEX2_FIFO_2_07 } },
++            GBISegment{ 0x1390,     0xCF55FAE288BFE48DULL,  { &F3DEX2_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0xB9FBB8E71F72B596ULL,  { &F3DEX2_FIFO_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1188,     0x5235C026EC14B4FBULL,  { &F3DLX2_FIFO_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1378,     0xC2AE06B691610132ULL,  { &F3DEX2_FIFO_2_08_CRUISN } }, // Needs confirmation.
++            GBISegment{ 0x1630,     0x4588323F6F7E7720ULL,  { &F3DEX2_FIFO_2_08_PL } },
++            GBISegment{ 0x13A0,     0xD734CFD78F6CCD45ULL,  { &F3DEX2_XBUS_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x13A0,     0x0A4F40D3A58CB674ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
++            GBISegment{ 0x1198,     0x3B23DFF75831391CULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
++            GBISegment{ 0x13A0,     0xA7B96A2FC8C94E60ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
 +            // [wcw2k] WWF WrestleMania 2000's AKI builds (Yasumoto 1999): "F3DEX xbus 2.08"
 +            // (3D) and "F3DLX.Rej xbus 2.08" (menus). Text differs from the stock builds,
 +            // but the 3D ucode's DATA hashes identically to F3DEX2_XBUS_2_08's 0x420-byte
 +            // entry below — same GBI command set for both, per family.
 +            GBISegment{ 0x13A0,     0x60BF253FA40991C0ULL,  { &F3DEX2_XBUS_2_08 } },
-             GBISegment{ 0x1198,     0xD5E0AABE069BA75CULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
-             GBISegment{ 0x1370,     0xCFCF197526613F82ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
-             GBISegment{ 0x1390,     0xDF624201BC21895EULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
-@@ -257,7 +268,7 @@
-             GBISegment{ 0x10B0,     0xE8028E4BC6529E6EULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
-     };
- 
--    static std::array<GBISegment, 105> dataSegments = {
++            GBISegment{ 0x1198,     0xD5E0AABE069BA75CULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x1370,     0xCFCF197526613F82ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0xDF624201BC21895EULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x0856C0CA45B9ABC4ULL,  { &F3DEX2_NON_FIFO_2_05 } },
++            GBISegment{ 0x1390,     0x07287E3B3682EFBBULL,  { &F3DEX2_NON_FIFO_ACCLAIM } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x150739719E00ADD0ULL,  { &F3DEX2_NON_FIFO_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0xA4686FA3C97AD3CCULL,  { &F3DEX2_NON_FIFO_2_07 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x4C12DAE0534D7135ULL,  { &F3DEX2_NON_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x35D374BE816BC7DAULL,  { &F3DEX2_NON_FIFO_2_08H } }, // Needs confirmation.
++            GBISegment{ 0x13A0,     0xBA58701614D1A902ULL,  { &F3DEX2_NON_XBUS_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x13A0,     0x9BF34794D785E01BULL,  { &F3DEX2_NON_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x1390,     0x1A24186AD41D2568ULL,  { &F3DZEX2_NON_FIFO_2_06H } },
++            GBISegment{ 0x1630,     0xF5EE0949F308CFE3ULL,  { &F3DZEX2_NON_FIFO_2_08I } },
++            GBISegment{ 0x1630,     0x7502444D3DDBD4BFULL,  { &F3DZEX2_NON_FIFO_2_08J } },
++            GBISegment{ 0xEA0,      0x76CC0F7EDCB9D6ADULL,  { &S2D } }, // Needs confirmation.
++            GBISegment{ 0xEA0,      0x129C21833F31999DULL,  { &S2D_A } }, // Needs confirmation.
++            GBISegment{ 0xED0,      0xE4910220BE1D53D7ULL,  { &S2D_FIFO } }, // Needs confirmation.
++            GBISegment{ 0xED0,      0x56E22D6B0FE5BDEEULL,  { &S2D_FIFO_A } }, // Needs confirmation.
++            GBISegment{ 0x17E0,     0x5034E426AA0213E3ULL,  { &S2DEX_1_03 } }, // Needs confirmation.
++            GBISegment{ 0x17E0,     0x24E4DE8F087EEF34ULL,  { &S2DEX_1_05 } }, // Needs confirmation.
++            GBISegment{ 0x17E0,     0xE3AABE6D3AA1DC84ULL,  { &S2DEX_1_06 } }, // Needs confirmation.
++            GBISegment{ 0x17E0,     0x874A5915C0C4C8A8ULL,  { &S2DEX_1_07 } },
++            GBISegment{ 0x18C0,     0xB524D27BED87DE3AULL,  { &S2DEX2_FIFO_2_04 } },
++            GBISegment{ 0x18C0,     0x7F6DEA6A33FF67BDULL,  { &S2DEX2_FIFO_2_05, &S2DEX2_FIFO_2_06, &S2DEX2_FIFO_2_07 } },
++            GBISegment{ 0x18C0,     0x252C09A4BBB2F9D3ULL,  { &S2DEX2_FIFO_2_05_SAFE } },
++            GBISegment{ 0x18C0,     0x9300F34F3B438634ULL,  { &S2DEX2_FIFO_2_08 } },
++            GBISegment{ 0x18D0,     0x1B84EB8DEF3DC2E7ULL,  { &S2DEX2_XBUS_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x18D0,     0xDD4DDB087A3CAC5EULL,  { &S2DEX2_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0xFA8,      0xCD640EC520D9F1E0ULL,  { &L3D_BC } }, // Needs confirmation.
++            GBISegment{ 0xF68,      0x75A9F04BCF222D6AULL,  { &L3DEX_1_00 } }, // Needs confirmation.
++            GBISegment{ 0xFF0,      0xCFAEE316F8AF900CULL,  { &L3DEX_1_21, &L3DEX_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0xFF0,      0xC8D5E51F62D4F740ULL,  { &L3DEX_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x1190,     0xA2F9906594260FD4ULL,  { &L3DEX2_FIFO_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x1190,     0x019210E4F59B27C1ULL,  { &L3DEX2_FIFO_ACCLAIM } }, // Needs confirmation.
++            GBISegment{ 0x1190,     0x60B6BA671EE6F1F6ULL,  { &L3DEX2_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x10B0,     0xE8028E4BC6529E6EULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
++    };
++
 +    static std::array<GBISegment, 106> dataSegments = {
-             GBISegment{ 0x800,      0xEEB10D73400213B3ULL,  { &F3D_SDK_E } }, // Needs confirmation.
-             GBISegment{ 0x800,      0x49651E384B48F694ULL,  { &F3D_SDK_F } }, // Needs confirmation.
-             GBISegment{ 0x800,      0x1A736198F90E81C5ULL,  { &F3D_SDK_UNKNOWN_G } }, // Needs confirmation.
-@@ -326,6 +337,8 @@
-             GBISegment{ 0x420,      0x1D0B2B02F7C09D84ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
-             GBISegment{ 0x410,      0xCE0DAA8259433956ULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
-             GBISegment{ 0x420,      0x5FB335C8CDF86F48ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xEEB10D73400213B3ULL,  { &F3D_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x49651E384B48F694ULL,  { &F3D_SDK_F } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x1A736198F90E81C5ULL,  { &F3D_SDK_UNKNOWN_G } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x1798191D01F4D743ULL,  { &F3D_NON_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x40C193AB87AD57AFULL,  { &F3D_NON_SDK_UNKNOWN_D } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xECD447C4539036A6ULL,  { &F3D_NON_SDK_UNKNOWN_G } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xE6332A7A1278B05DULL,  { &F3D_NON_FIFO_SDK_E } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x6D784F182608475DULL,  { &F3D_SDK_UNKNOWN_H } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xD17ED94BB63DC244ULL,  { &F3D_BC } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x89E9CDC032C3F810ULL,  { &F3D_FB } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x276AC049785A7E70ULL,  { &F3D_SM64, &F3D_FIFO_SDK_E } },
++            GBISegment{ 0x800,      0x880FCE853CE3E422ULL,  { &F3D_SM64_FINAL } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xF6D6112068370B46ULL,  { &F3D_FIFO_SDK_F } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x53AF11FA4205F4E7ULL,  { &F3D_WAYNE } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x72AD2373CEC74AA7ULL,  { &F3D_PD } },
++            GBISegment{ 0x800,      0xB2152361A81ED3B0ULL,  { &F3D_GOLDEN } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x3E7A693EA9A18E45ULL,  { &F3D_WAVE } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x4BB61D72241EFD23ULL,  { &F3DEX_0_95 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x58641378A6D4FF0CULL,  { &F3DLX_0_95 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x1D53DE103B933358ULL,  { &F3DEX_0_96 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x478F5508A96A070BULL,  { &F3DLP_0_96_REJ } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xCE617F2A645340F4ULL,  { &F3DEX_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x4B5FDED20C137EC1ULL,  { &F3DEX_1_21, &F3DEX_1_21_A } },
++            GBISegment{ 0x800,      0xCCF255DEB0FAA63DULL,  { &F3DLX_1_21 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x484C6940F5072C39ULL,  { &F3DLX_1_21_REJ } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x914E659B39FAE202ULL,  { &F3DLP_1_21_REJ } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x360E69EA3E9EB6B7ULL,  { &F3DLX_1_22 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x312E7A6E9F144186ULL,  { &F3DEX_NON_1_22_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x3828B4F75B0A0E6AULL,  { &F3DEX_1_23 } },
++            GBISegment{ 0x800,      0x4A9D9C1BBFFEA48DULL,  { &F3DEX_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xEDDB46181FE78DE8ULL,  { &F3DLX_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x2773FDFC5E62C0B0ULL,  { &F3DLX_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x6BD0FEA8C97D3442ULL,  { &F3DLX_1_23_REJ } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x2A042AE973C2E3ABULL,  { &F3DLX_1_23_REJ_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x50D70B247E16A681ULL,  { &F3DLP_1_23_REJ } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x6BF03BD84C267741ULL,  { &F3DTEXA_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xC3131EA8EB614FE3ULL,  { &F3DEX_NON_0_96 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xD19BE2945518BDA8ULL,  { &F3DEX_NON_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x43B301361EBFD848ULL,  { &F3DLX_NON_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xEACD63EAECAF00B5ULL,  { &F3DEX_NON_1_21, &F3DEX_NON_1_21_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xA5E20037AB033BE2ULL,  { &F3DLX_NON_1_21 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x2A0468F401EEBDFAULL,  { &F3DEX_NON_1_22 } },
++            GBISegment{ 0x800,      0xEC283C51058DB925ULL,  { &F3DEX_NON_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xCCB420ED1CC65F3FULL,  { &F3DEX_NON_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x9C7395BAB35E1E49ULL,  { &F3DLX_NON_1_23, } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x73678EC81B2D0D1FULL,  { &F3DLX_NON_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x3BF767E62B44ABC6ULL,  { &F3DEX2_FIFO_2_03 } }, // Needs confirmation.
++            GBISegment{ 0x410,      0xE967951D7760E73CULL,  { &F3DLX2_FIFO_2_03_REJ } }, // Needs confirmation.
++            GBISegment{ 0x3B0,      0x33FF4026CF6458F5ULL,  { &F3DFLX2_FIFO_2_03F_REJ } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xB2C65790C7A8D338ULL,  { &F3DEX2_FIFO_2_04 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x4484B6D3398C3B6CULL,  { &F3DEX2_FIFO_2_04H } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xF71B0A57D680F2B3ULL,  { &F3DEX2_FIFO_2_05 } },
++            GBISegment{ 0x410,      0x9AB5B5144A3BD300ULL,  { &F3DEX2_FIFO_2_05_REJ } }, // Needs confirmation.
++            GBISegment{ 0x410,      0x7BF113F398B8301CULL,  { &F3DLX2_FIFO_2_05_REJ } }, // Needs confirmation.
++            GBISegment{ 0x430,      0xD7D5F81345FC5310ULL,  { &F3DAM2_FIFO_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xD4619CEDD1213E15ULL,  { &F3DEX2_FIFO_2_06 } },
++            GBISegment{ 0x410,      0xD3135F48A08C1982ULL,  { &F3DEX2_FIFO_2_06_REJ } }, // Needs confirmation.
++            GBISegment{ 0x410,      0x47BA278DD7DB79EBULL,  { &F3DLX2_FIFO_2_06_REJ } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xF8649121FAB40A06ULL,  { &F3DEX2_FIFO_2_07 } },
++            GBISegment{ 0x420,      0x3D4CAB9C82AD3772ULL,  { &F3DEX2_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x410,      0x14F9D11C0F58AFB5ULL,  { &F3DEX2_FIFO_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x410,      0x25A00931C3C2A573ULL,  { &F3DLX2_FIFO_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xD381B0139965EE5CULL,  { &F3DEX2_FIFO_2_08_CRUISN } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xB411ADC06FAA9D83ULL,  { &F3DEX2_FIFO_2_08_PL } },
++            GBISegment{ 0x420,      0x58BA836DE5C3B968ULL,  { &F3DEX2_XBUS_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x1D0B2B02F7C09D84ULL,  { &F3DEX2_XBUS_2_07 } }, // Needs confirmation.
++            GBISegment{ 0x410,      0xCE0DAA8259433956ULL,  { &F3DLX2_XBUS_2_07_REJ } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x5FB335C8CDF86F48ULL,  { &F3DEX2_XBUS_2_08 } }, // Needs confirmation.
 +            // [wcw2k] WM2000's "F3DLX.Rej xbus 2.08" ucode data (see text-segment note).
 +            GBISegment{ 0x420,      0xE49057B911FDCAFAULL,  { &F3DLX2_XBUS_2_08_REJ } },
-             GBISegment{ 0x410,      0x2869DC3116DEA560ULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
-             GBISegment{ 0x420,      0x38FF0FE9D7CFBD34ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
-             GBISegment{ 0x420,      0x2E3B70A49807BF89ULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
-@@ -438,6 +451,17 @@
-         if (textSegmentIndex < 0 || dataSegmentIndex < 0) {
-             fprintf(stderr, "Unable to find a matching GBI in the current database. This game is not supported in HLE.\n");
-             deduceGBIInformation(RDRAM, textAddress, dataAddress);
++            GBISegment{ 0x410,      0x2869DC3116DEA560ULL,  { &F3DLX2_XBUS_2_08_REJ } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x38FF0FE9D7CFBD34ULL,  { &F3DEX2_NON_FIFO_2_03 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x2E3B70A49807BF89ULL,  { &F3DEX2_NON_FIFO_2_04 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xE57A61CA7770A4EAULL,  { &F3DEX2_NON_FIFO_2_05 } },
++            GBISegment{ 0x420,      0xD62BDC3A200CBB35ULL,  { &F3DEX2_NON_FIFO_ACCLAIM } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xD415349186DC365CULL,  { &F3DEX2_NON_FIFO_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x806BEAF49F944E89ULL,  { &F3DEX2_NON_FIFO_2_07 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x3BE3FAD9073FEB78ULL,  { &F3DEX2_NON_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xE762274AB4B747CDULL,  { &F3DEX2_NON_FIFO_2_08H } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x3E29DC0570E8B835ULL,  { &F3DEX2_NON_XBUS_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0x8309F513B20C9040ULL,  { &F3DEX2_NON_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x420,      0xE3E5C20BC750105EULL,  { &F3DZEX2_NON_FIFO_2_06H } },
++            GBISegment{ 0x420,      0x002D7FA254ABD8E7ULL,  { &F3DZEX2_NON_FIFO_2_08I } },
++            GBISegment{ 0x420,      0x6069A2803CB39E66ULL,  { &F3DZEX2_NON_FIFO_2_08J } },
++            GBISegment{ 0xFC0,      0xDC8A6B7535C3EC67ULL,  { &S2D, &S2D_A } }, // Needs confirmation.
++            GBISegment{ 0xFC0,      0x6255273A8C5887F3ULL,  { &S2D_FIFO, &S2D_FIFO_A } }, // Needs confirmation.
++            GBISegment{ 0x3C0,      0x59EE4D449CA1F9AFULL,  { &S2DEX_1_03 } }, // Needs confirmation.
++            GBISegment{ 0x3C0,      0x14A890EC7B06F2E9ULL,  { &S2DEX_1_05 } }, // Needs confirmation.
++            GBISegment{ 0x3C0,      0x7A9811CF7E7FCCCFULL,  { &S2DEX_1_06 } }, // Needs confirmation.
++            GBISegment{ 0x3C0,      0x2018F33CBC3E2818ULL,  { &S2DEX_1_07 } },
++            GBISegment{ 0x390,      0xB3108E4928CB6B1DULL,  { &S2DEX2_FIFO_2_04 } },
++            GBISegment{ 0x390,      0x47829093527F366BULL,  { &S2DEX2_FIFO_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x390,      0x01DE3936615B8C9CULL,  { &S2DEX2_FIFO_2_05_SAFE } },
++            GBISegment{ 0x390,      0x507670688A6E0671ULL,  { &S2DEX2_FIFO_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x390,      0xB0FA15F7CFBB1978ULL,  { &S2DEX2_FIFO_2_07 } }, // Needs confirmation.
++            GBISegment{ 0x390,      0x50EF0DFBD3A8CD0FULL,  { &S2DEX2_FIFO_2_08 } },
++            GBISegment{ 0x390,      0x123C6688307483B6ULL,  { &S2DEX2_XBUS_2_06 } }, // Needs confirmation.
++            GBISegment{ 0x390,      0x4143792286C20CFFULL,  { &S2DEX2_XBUS_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x4B2D1A8C46895B0DULL,  { &L3D_BC } }, // Needs confirmation.
++            GBISegment{ 0x800,      0xD15737A2A52F0B12ULL,  { &L3DEX_1_00 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x5C189B2C6243EB6DULL,  { &L3DEX_1_21 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x880EF9B9011CB11EULL,  { &L3DEX_1_23 } }, // Needs confirmation.
++            GBISegment{ 0x800,      0x67315143B3DE852EULL,  { &L3DEX_1_23_A } }, // Needs confirmation.
++            GBISegment{ 0x3F0,      0x58F659DEBA493C69ULL,  { &L3DEX2_FIFO_2_05 } }, // Needs confirmation.
++            GBISegment{ 0x3F0,      0x772E4F4BD7F82DEFULL,  { &L3DEX2_FIFO_ACCLAIM } }, // Needs confirmation.
++            GBISegment{ 0x3F0,      0xE261C98A63863DB4ULL,  { &L3DEX2_FIFO_2_08 } }, // Needs confirmation.
++            GBISegment{ 0x400,      0x8F5D64011662220CULL,  { &ZSORTP_0_33 } }, // Needs confirmation.
++    };
++
++    static bool textAndDataSegmentsSorted = false;
++
++    // GBIManager
++
++    GBIManager::GBIManager() {
++        GBI_EXTENDED::initialize();
++
++        if (!textAndDataSegmentsSorted) {
++            std::sort(textSegments.begin(), textSegments.end());
++            std::sort(dataSegments.begin(), dataSegments.end());
++            textAndDataSegmentsSorted = true;
++        }
++    }
++
++    GBIManager::~GBIManager() {
++        // Does nothing.
++    }
++    
++    GBI *GBIManager::getGBIForRDP() {
++        GBI &gbi = gbiCache[uint32_t(GBIUCode::RDP)];
++        if (gbi.ucode == GBIUCode::Unknown) {
++            gbi.ucode = GBIUCode::RDP;
++            GBI_RDP::setup(&gbi, false);
++        }
++
++        return &gbi;
++    }
++    
++    GBI *GBIManager::getGBIForUCode(uint8_t *RDRAM, uint32_t textAddress, uint32_t dataAddress) {
++        assert(RDRAM != nullptr);
++
++        int32_t textSegmentIndex = -1;
++        uint8_t *rdramCursor = &RDRAM[textAddress];
++        uint32_t rdramHashed = 0;
++        uint64_t rdramHash = 0;
++        XXH3_state_t xxh3;
++        XXH3_64bits_reset(&xxh3);
++
++        auto hashSegment = [&](uint32_t index, const GBISegment &gbiSegment, int32_t &resultIndex) {
++            if (gbiSegment.hashLength > rdramHashed) {
++                const uint32_t rdramToHash = gbiSegment.hashLength - rdramHashed;
++                XXH3_64bits_update(&xxh3, rdramCursor, rdramToHash);
++                rdramHash = XXH3_64bits_digest(&xxh3);
++                rdramCursor += rdramToHash;
++                rdramHashed += rdramToHash;
++            }
++
++            if (rdramHash == gbiSegment.hashValue) {
++                resultIndex = int32_t(index);
++            }
++
++            // If we used an unknown value in the database, print the hash.
++            if (gbiSegment.hashValue == GBI_UNKNOWN_HASH_NUMB) {
++                fprintf(stdout, "HASH: 0x%016" PRIX64 "ULL SIZE: 0x%X\n", rdramHash, rdramHashed);
++            }
++        };
++
++        for (uint32_t i = 0; i < textSegments.size(); i++) {
++            hashSegment(i, textSegments[i], textSegmentIndex);
++        }
++
++        int32_t dataSegmentIndex = -1;
++        XXH3_64bits_reset(&xxh3);
++        rdramCursor = &RDRAM[dataAddress];
++        rdramHashed = 0;
++        rdramHash = 0;
++        for (uint32_t i = 0; i < dataSegments.size(); i++) {
++            hashSegment(i, dataSegments[i], dataSegmentIndex);
++        }
++
++        if (textSegmentIndex < 0 || dataSegmentIndex < 0) {
++            fprintf(stderr, "Unable to find a matching GBI in the current database. This game is not supported in HLE.\n");
++            deduceGBIInformation(RDRAM, textAddress, dataAddress);
 +            // [wcw2k] DIAGNOSTIC: print hashes at common segment sizes so an unknown ucode
 +            // can be added to the database (WM2000 ships "F3DEX xbus 2.08", an AKI-era
 +            // build absent from the tables).
@@ -754,6 +3126,129 @@
 +                fprintf(stderr, "[wcw][gbi] datahash(len=0x%X)=0x%016" PRIX64 "ULL data=0x%X\n",
 +                    dlen, XXH3_64bits(&RDRAM[dataAddress], dlen), dataAddress);
 +            }
-             return nullptr;
-         }
- 
++            return nullptr;
++        }
++
++        // Search for the first intersection available between both segments.
++        const GBISegment &textSegment = textSegments[textSegmentIndex];
++        const GBISegment &dataSegment = dataSegments[dataSegmentIndex];
++        const GBIInstance *matchingInstance = nullptr;
++        for (const GBIInstance *textInstance : textSegment.instances) {
++            for (const GBIInstance *dataInstance : dataSegment.instances) {
++                if (textInstance == dataInstance) {
++                    matchingInstance = dataInstance;
++                    break;
++                }
++            }
++        }
++
++        if (matchingInstance == nullptr) {
++            fprintf(stderr, "Unable to find a GBI that is shared between the text and data segment. Is the GBI database configured incorrectly?\n");
++            return nullptr;
++        }
++
++        // [wcw] DIAGNOSTIC: report which GBI the ucode hash matched.
++        fprintf(stderr, "[wcw][gbi] matched ucode: name='%s' enum=%d (text=0x%X data=0x%X)\n",
++            matchingInstance->name, (int)matchingInstance->ucode, textAddress, dataAddress);
++
++        GBI &gbi = gbiCache[uint32_t(matchingInstance->ucode)];
++        if (gbi.ucode == GBIUCode::Unknown) {
++            gbi.ucode = matchingInstance->ucode;
++
++            // Common RDP functions.
++            GBI_RDP::setup(&gbi, true);
++
++            switch (gbi.ucode) {
++            case GBIUCode::RDP:
++                break;
++            case GBIUCode::F3D:
++                GBI_F3D::setup(&gbi);
++                break;
++            case GBIUCode::F3DGOLDEN:
++                GBI_F3DGOLDEN::setup(&gbi);
++                break;
++            case GBIUCode::F3DPD:
++                GBI_F3DPD::setup(&gbi);
++                break;
++            case GBIUCode::F3DWAVE:
++                GBI_F3DWAVE::setup(&gbi);
++                break;
++            case GBIUCode::F3DEX:
++                GBI_F3DEX::setup(&gbi);
++                break;
++            case GBIUCode::F3DEX2:
++                GBI_F3DEX2::setup(&gbi);
++                break;
++            case GBIUCode::F3DZEX2:
++                GBI_F3DZEX2::setup(&gbi);
++                break;
++            case GBIUCode::S2DEX:
++                GBI_S2DEX::setup(&gbi);
++                break;
++            case GBIUCode::S2DEX2:
++                GBI_S2DEX2::setup(&gbi);
++                break;
++            case GBIUCode::L3DEX2:
++                GBI_L3DEX2::setup(&gbi);
++                break;
++            default:
++                assert(false && "Unknown UCode.");
++                break;
++            }
++        }
++
++        // Update the cached GBI to use the instance's flags.
++        gbi.flags = matchingInstance->flags;
++
++        return &gbi;
++    }
++
++    void GBIManager::deduceGBIInformation(uint8_t *RDRAM, uint32_t textAddress, uint32_t dataAddress) {
++        const uint8_t rspPattern[] = "RSP";
++        uint8_t dataSegmentBytes[0x800];
++        uint8_t *dataSegmentBytesEnd = dataSegmentBytes + std::size(dataSegmentBytes);
++        for (size_t i = 0; i < std::size(dataSegmentBytes); i++) {
++            dataSegmentBytes[i] = RDRAM[(dataAddress + i) ^ 0x3];
++        }
++
++        const uint8_t *searchResult = std::search(dataSegmentBytes, dataSegmentBytesEnd, rspPattern, rspPattern + std::size(rspPattern) - 1);
++        if (searchResult != dataSegmentBytesEnd) {
++            uint32_t validChars = 0;
++            while (searchResult[validChars] > 0x0A) {
++                validChars++;
++            }
++
++            if (validChars > 0) {
++                const uint8_t *searchResultEnd = searchResult + validChars;
++                fprintf(stderr, "Detected name in data: %.*s\n", validChars, searchResult);
++
++                const uint8_t f3dexPattern[] = "F3DEX";
++                const uint8_t s2dexPattern[] = "S2DEX";
++                const uint8_t twoPointPattern[] = "2.";
++                const uint8_t *f3dexResult = std::search(searchResult, searchResultEnd, f3dexPattern, f3dexPattern + std::size(f3dexPattern) - 1);
++                const uint8_t *twoPointResult = std::search(searchResult, searchResultEnd, twoPointPattern, twoPointPattern + std::size(twoPointPattern) - 1);
++                if ((f3dexResult != searchResultEnd) && (twoPointResult != searchResultEnd)) {
++                    const uint32_t lastOverlay = *reinterpret_cast<const uint32_t *>(&RDRAM[dataAddress + 0x410]);
++                    const uint16_t lastOverlaySize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x414) ^ 2]);
++                    const uint16_t estimatedDataSize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x380) ^ 2]);
++                    const uint32_t textSize = lastOverlay + lastOverlaySize + 1;
++                    fprintf(stderr, "Detected text size is 0x%X\n", textSize);
++                    fprintf(stderr, "Estimated data size is 0x%X\n", estimatedDataSize);
++                }
++
++                const uint8_t *s2dexResult = std::search(searchResult, searchResultEnd, s2dexPattern, s2dexPattern + std::size(s2dexPattern) - 1);
++                if ((s2dexResult != searchResultEnd) && (twoPointResult != searchResultEnd)) {
++                    const uint32_t lastOverlay = *reinterpret_cast<const uint32_t *>(&RDRAM[dataAddress + 0x31C]);
++                    const uint16_t lastOverlaySize = *reinterpret_cast<const uint16_t *>(&RDRAM[(dataAddress + 0x320) ^ 2]);
++                    const uint32_t textSize = lastOverlay + lastOverlaySize + 1;
++                    fprintf(stderr, "Detected text size is 0x%X\n", textSize);
++                }
++            }
++        }
++    }
++
++    GBIFunction GBIManager::getExtendedFunction() const {
++        return &GBI_EXTENDED::extendedOp;
++    }
+ };
+\ No newline at end of file

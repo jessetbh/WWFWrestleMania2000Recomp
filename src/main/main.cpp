@@ -259,10 +259,30 @@ ultramodern::input::connected_device_info_t get_connected_device_info(int contro
 // ---------------- audio (minimal: queue as-is, 16-bit stereo) ----------------
 static SDL_AudioDeviceID g_audio_device = 0;
 static uint32_t g_sample_rate = 32000;
+static uint32_t g_requested_rate = 0;
 constexpr uint32_t input_channels = 2;
 constexpr uint32_t bytes_per_frame = input_channels * sizeof(int16_t);
 
+// With no audio endpoint (headless/unattended session) queued audio used to vanish:
+// get_frames_remaining()==0 forever, so the game's AI-full throttle never engages and the
+// audio task loop free-runs (~500/s, bringup-plan session 4). Model a device that drains
+// the queue in real time so pacing works endpoint or not.
+static uint64_t g_virtual_frames = 0;
+static uint64_t g_virtual_last_ms = 0;
+static void virtual_drain() {
+    uint64_t now = SDL_GetTicks64();
+    if (g_virtual_last_ms) {
+        uint64_t drained = (now - g_virtual_last_ms) * g_sample_rate / 1000;
+        g_virtual_frames = drained >= g_virtual_frames ? 0 : g_virtual_frames - drained;
+    }
+    g_virtual_last_ms = now;
+}
+
 static bool reset_audio(uint32_t freq) {
+    // Diagnostic: every open/close drops the whole SDL queue, so frequent calls here
+    // zero osAiGetLength and free-run the game's audio generator (bringup-plan session 4).
+    { static int n = 0; fprintf(stderr, "[audio] reset_audio #%d freq=%u driver=%s (had_device=%d)\n",
+        n++, freq, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none", g_audio_device != 0); }
     SDL_AudioSpec want{}, have{};
     want.freq = (int)freq;
     want.format = AUDIO_S16SYS;
@@ -273,13 +293,28 @@ static bool reset_audio(uint32_t freq) {
     want.callback = nullptr;
     if (g_audio_device) { SDL_CloseAudioDevice(g_audio_device); g_audio_device = 0; }
     g_audio_device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-    if (g_audio_device == 0) { fprintf(stderr, "SDL_OpenAudioDevice failed: %s\n", SDL_GetError()); return false; }
+    if (g_audio_device == 0) {
+        fprintf(stderr, "SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        g_sample_rate = freq; // keep the virtual-drain model at the game's real rate
+        return false;
+    }
     g_sample_rate = (uint32_t)have.freq;
+    g_virtual_frames = 0;
+    fprintf(stderr, "[audio] device opened id=%u have.freq=%d have.samples=%u\n",
+        (unsigned)g_audio_device, have.freq, (unsigned)have.samples);
     SDL_PauseAudioDevice(g_audio_device, 0);
     return true;
 }
 
-void set_frequency(uint32_t freq) { reset_audio(freq); }
+void set_frequency(uint32_t freq) {
+    // Reopening the device discards SDL's entire queued buffer, so skip redundant calls
+    // (WM2000 re-sets 28800 on menu transitions — each one was an audible drop).
+    if (g_audio_device && freq == g_requested_rate) return;
+    g_requested_rate = freq;
+    reset_audio(freq);
+}
+
+size_t get_frames_remaining();
 
 void queue_samples(int16_t* audio_data, size_t sample_count) {
     // audio_data is interleaved stereo; swap L/R to correct for endianness handling.
@@ -289,8 +324,13 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
         buf[i + 0] = audio_data[i + 1];
         buf[i + 1] = audio_data[i + 0];
     }
-    uint32_t queued_frames_before = g_audio_device ? SDL_GetQueuedAudioSize(g_audio_device) / bytes_per_frame : 0;
-    if (g_audio_device) SDL_QueueAudio(g_audio_device, buf.data(), (Uint32)(sample_count * sizeof(int16_t)));
+    uint32_t queued_frames_before = (uint32_t)get_frames_remaining();
+    if (g_audio_device) {
+        SDL_QueueAudio(g_audio_device, buf.data(), (Uint32)(sample_count * sizeof(int16_t)));
+    } else {
+        virtual_drain();
+        g_virtual_frames += sample_count / input_channels;
+    }
     // Diagnostic (1/s): audio health. queued_frames_before==0 means the device ran dry and
     // SDL fed silence (an audible pop); minlvl is the low-water mark in frames; maxgap the
     // longest interval between batches (starvation if it exceeds the buffered duration).
@@ -314,7 +354,10 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
 }
 
 size_t get_frames_remaining() {
-    if (!g_audio_device) return 0;
+    if (!g_audio_device) {
+        virtual_drain();
+        return (size_t)g_virtual_frames;
+    }
     return SDL_GetQueuedAudioSize(g_audio_device) / bytes_per_frame;
 }
 
