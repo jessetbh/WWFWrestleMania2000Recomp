@@ -54,3 +54,16 @@ ignored = [
 func = "func_800004D0"
 vram = 0x800005AC
 value = 0x1000FFFF
+
+# Music invalid-id assert defused (bringup-plan session 5). func_80003DD4(out, id)
+# resolves a song id (valid 1..0x2847) to its ROM location; its invalid-id branch is
+# `j .` — an assert-hang that recompiles to pause_self and parks the calling thread
+# FOREVER (observed boot36/38: gfx frozen, audio alive). The corrupt ids came from a
+# music-slot init/use race that only opened under the (since-fixed) scheduler
+# starvation, but a silent permanent park is the worst possible failure mode, so:
+# rewrite the j-self at 0x80003DF0 to `addiu $a1, $zero, 1` (0x24050001) — an invalid
+# id falls through and resolves as song 1: deterministic, in-range, no hang.
+[[patches.instruction]]
+func = "func_80003DD4"
+vram = 0x80003DF0
+value = 0x24050001
