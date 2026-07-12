@@ -44,14 +44,17 @@ for path in sorted(glob.glob(os.path.join(ROOT, 'RecompiledFuncs', 'funcs_*.c'))
             continue
         sec = name2sec.get(name)
         if sec is None:
-            # N64Recomp emits some injected entries as static_N_XXXXXXXX; resolve the
-            # section by the body's first decoded address if it's unique in dump.toml.
-            first = int(addrs[0], 16)
-            cands = [s for (s, v) in by_sec_vram if v == first]
-            if len(cands) == 1:
-                sec = cands[0]
+            # N64Recomp emits injected entries as static_<section_index>_<vram>; the
+            # index is the section's position in dump.toml order. Resolving by
+            # "unique address in dump.toml" instead is WRONG for overlays: boot85's
+            # post-match crash was static_9_8012DBB0 (ovl_d, index 9) resolved to
+            # ovl_c (the only section with a named symbol at that address) and
+            # chained into OVL_C's func_8012DC3C -- menu code run on match data.
+            sm = re.match(r'static_(\d+)_[0-9A-Fa-f]+$', name)
+            if sm and int(sm.group(1)) < len(sec_positions):
+                sec = sec_positions[int(sm.group(1))][1]
             else:
-                print('SKIP %s: ambiguous/unknown section for 0x%08X (%s)' % (name, first, cands))
+                print('SKIP %s: unknown section' % name)
                 continue
         nxt = int(addrs[-1], 16) + 4
         succ = by_sec_vram.get((sec, nxt))
