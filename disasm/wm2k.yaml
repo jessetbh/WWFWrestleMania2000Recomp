@@ -94,6 +94,15 @@ segments:
     subsegments:
       - [0x4C160, asm]
       - [0x694E0, data]
+      # ovl_a hidden code pocket (session 5): rom 0x70EF8 (vram 0x80106928) holds real
+      # IDO cold code inside ovl_a's data. Single proven entry: ovl_c's func_80120B84
+      # tail-jumps `j 0x80106928` — and ovl_c can ONLY coexist with ovl_a (ovl_d spans
+      # both slots), so that jump can never mean ovl_d's same-address function. With
+      # this region left as data, N64Recomp statically bound the jump to OVL_D's copy
+      # and executed match-engine code against menu data (post-menu crash, boots
+      # 75-78). Decoding it makes 0x80106928 ambiguous -> runtime LOOKUP. Non-code
+      # bytes decode as junk that never executes (ovl_c-island precedent).
+      - [0x70EF8, asm]
       - { type: bss, vram: 0x80108DC0 }
 
   # Swap slot 0x8011C900: ovl_b (small) and ovl_c (large); either can sit alongside
