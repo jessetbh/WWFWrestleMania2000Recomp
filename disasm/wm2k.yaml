@@ -69,10 +69,18 @@ segments:
     subsegments:
       - [0x1050, asm]
       - [0x39440, data]
+      # cold-code pocket #2 (session 5): rom 0x3A1D8 (vram 0x800395D8) holds REAL IDO
+      # cold-path fragments (e.g. func_8012DB64's excursion, ending `j 0x8012DC3C`
+      # back into the overlay). Previously mapped as data -> recompiled as an EMPTY
+      # function -> every pass leaked the caller's 0x30 stack frame (0xC0/frame during
+      # menu music) -> the stack descended through thread 6's TCB ("TCB wipes"), the
+      # music slots, and saved-register slots: the whole transition-corruption family.
+      # Non-code bytes in the range decode as junk functions that never execute (same
+      # precedent as the ovl_c island).
+      - [0x3A1D8, asm]
       # late code pocket: 11 j/jal targets from game code land in 0x3C0D0-0x3C628
       # (found when func_80006668's `j 0x8003B628` tail call failed to recompile);
-      # asm resumes there, last jr $ra at 0x3C620.
-      - [0x3C0D0, asm]
+      # asm continues through it, last jr $ra at 0x3C620.
       - [0x3C628, data]
 
   # Swap slot 0x800E1B90: ovl_a (menus?) and ovl_d (match engine?) — ovl_d also

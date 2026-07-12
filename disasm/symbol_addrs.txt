@@ -1,1 +1,6 @@
 func_80038480 = 0x80038480; // type:func size:0x2BC
+// junk fragment (jr $zero / $zero-dest garbage): must be its OWN function so the
+// gen_symbols skip list (syms/skip_functions.txt) can drop it; the session-5 re-split
+// merged it into the preceding function's body, breaking the build. Next real code
+// resumes at func_8003B628.
+func_8003B60C = 0x8003B60C; // type:func size:0x1C

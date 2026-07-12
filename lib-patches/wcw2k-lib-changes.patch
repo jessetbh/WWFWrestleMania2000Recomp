@@ -263,8 +263,37 @@
  
  extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-07 15:35:26.717619900 -0400
-+++ lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-11 22:09:04.367521000 -0400
-@@ -28,5 +28,12 @@
++++ lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-12 09:26:13.307678100 -0400
+@@ -6,11 +6,25 @@
+ 
+ #define VI_NTSC_CLOCK 48681812
+ 
++// [wcw2k] Hardware-accurate osAiSetFrequency return, opt-in per project (default off =
++// WT/Revenge unchanged). On console the AI quantizes the rate through the DAC divisor
++// and osAiSetFrequency RETURNS the actual rate (28800 -> dacRate 1690 -> 28805); AKI
++// audio init sizes its heap allocations from that return value. Returning the requested
++// rate unquantized shrinks WM2000's audio DMA buffers by a few samples each, shifting
++// every subsequent audio-heap allocation ~0xA0-0x140 LOW — low enough that the audio
++// manager's scheduler-client node lands INSIDE thread 6's linker-fixed boot stack
++// (top 0x800839A0). The scheduler then writes message values over the stack slot
++// where the transition chain saved s0 -> thread 6 restores s0=1 -> deterministic crash
++// in func_800222D8 entering gameplay (boots 48-54, session-5 part 5).
++bool wcw_ai_accurate_freq = false;
++
+ extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
+     uint32_t freq = ctx->r4;
+-    // This makes actual audio frequency more accurate to console, but may not be desirable
+-    //uint32_t dacRate = (uint32_t)(((float)VI_NTSC_CLOCK / freq) + 0.5f);
+-    //freq = VI_NTSC_CLOCK / dacRate;
++    if (wcw_ai_accurate_freq) {
++        uint32_t dacRate = (uint32_t)(((float)VI_NTSC_CLOCK / freq) + 0.5f);
++        freq = VI_NTSC_CLOCK / dacRate;
++        fprintf(stderr, "[wcw][ai] osAiSetFrequency(%u) -> %u (dacRate %u)\n", (unsigned)ctx->r4, freq, dacRate);
++    }
+     ctx->r2 = freq;
+     ultramodern::set_audio_frequency(freq);
+ }
+@@ -28,5 +42,12 @@
  }
  
  extern "C" void osAiGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -291,8 +320,8 @@
  
  #endif
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-07 15:35:26.738994100 -0400
-+++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-11 23:10:37.969812100 -0400
-@@ -1,369 +1,707 @@
++++ lib/N64ModernRuntime/ultramodern/src/threads.cpp	2026-07-11 23:23:33.638809900 -0400
+@@ -1,369 +1,721 @@
 -#include <cstdio>
 -#include <thread>
 -#include <cassert>
@@ -1073,31 +1102,45 @@
 +static void wcw2k_spraywatch(RDRAM_ARG const char* where) {
 +    static const bool enabled = getenv("WCW2K_SPRAYWATCH") != nullptr;
 +    if (!enabled) return;
-+    constexpr uint32_t base = 0x80080000, size = 0x4000, line = 64;
-+    static uint8_t prev[size];
++    // Watch thread 6's TCB (0x800807F0, 0x30 host bytes + margin) word-by-word: boot50
++    // showed the render thread making STRUCTURED writes into it (state/flags
++    // transitions, a pointer at +0x18, evolving values), not a bulk fill — the game
++    // appears to run its own thread bookkeeping against stock-libultra TCB offsets.
++    constexpr uint32_t base = 0x800807C0, size = 0xA0;
++    static uint32_t prev[size / 4];
 +    static bool primed = false;
-+    const uint8_t* cur = (const uint8_t*)TO_PTR(void, (int32_t)base);
++    const uint32_t* cur = (const uint32_t*)TO_PTR(void, (int32_t)base);
 +    if (!primed) { memcpy(prev, cur, size); primed = true; return; }
 +    PTR(OSThread) self_ = ultramodern::this_thread();
-+    // Thread 6 struct = 0x800807F0: its own runs legitimately write its stack.
++    // Thread 6 itself and the scheduler legitimately write its TCB.
 +    if ((uint32_t)self_ == 0x800807F0u) { memcpy(prev, cur, size); return; }
-+    int shown = 0; uint32_t changed = 0;
-+    for (uint32_t off = 0; off < size; off += line) {
-+        if (memcmp(prev + off, cur + off, line) != 0) {
-+            changed++;
-+            if (shown < 4) {
-+                const uint32_t* w = (const uint32_t*)(cur + off);
-+                fprintf(stderr, "[wcw2k][spray] 0x%08X: %08X %08X %08X %08X (by struct=0x%08X id=%d at %s)\n",
-+                    base + off, w[0], w[1], w[2], w[3], (uint32_t)self_,
-+                    self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
-+                shown++;
-+            }
++    int shown = 0;
++    for (uint32_t i = 0; i < size / 4; i++) {
++        if (cur[i] != prev[i] && shown < 8) {
++            fprintf(stderr, "[wcw2k][spray] 0x%08X: %08X -> %08X (by struct=0x%08X id=%d at %s)\n",
++                base + i * 4, prev[i], cur[i], (uint32_t)self_,
++                self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
++            shown++;
 +        }
 +    }
-+    if (changed > 4) {
-+        fprintf(stderr, "[wcw2k][spray] ... %u lines changed total (by struct=0x%08X)\n", changed, (uint32_t)self_);
++    if (shown) { memcpy(prev, cur, size); }
++
++    // Second window: thread 6's shallow stack frames (func_800222D8's 0x40-byte frame
++    // below entry sp 0x80083990). The deterministic crash restores saved-s0 == 1 from
++    // here; trap any word BECOMING 1 to identify the slot and the writer.
++    constexpr uint32_t fbase = 0x80083900, fsize = 0xA0;
++    static uint32_t fprev[fsize / 4];
++    static bool fprimed = false;
++    const uint32_t* fcur = (const uint32_t*)TO_PTR(void, (int32_t)fbase);
++    if (!fprimed) { memcpy(fprev, fcur, fsize); fprimed = true; return; }
++    for (uint32_t i = 0; i < fsize / 4; i++) {
++        if (fcur[i] != fprev[i] && (fcur[i] == 1 || fprev[i] == 1)) {
++            fprintf(stderr, "[wcw2k][frame] 0x%08X: %08X -> %08X (by struct=0x%08X id=%d at %s)\n",
++                fbase + i * 4, fprev[i], fcur[i], (uint32_t)self_,
++                self_ != NULLPTR ? TO_PTR(OSThread, self_)->id : -1, where);
++        }
 +    }
-+    if (changed) { memcpy(prev, cur, size); }
++    memcpy(fprev, fcur, fsize);
 +}
 +
 +void run_next_thread(RDRAM_ARG1) {
@@ -1430,8 +1473,8 @@
      cur = queue_to_ptr(PASS_RDRAM queue_);
      while (*cur) {
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-07 15:35:26.737491200 -0400
-+++ lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-08 23:12:59.263596300 -0400
-@@ -1,392 +1,425 @@
++++ lib/N64ModernRuntime/ultramodern/src/mesgqueue.cpp	2026-07-12 09:35:47.564568400 -0400
+@@ -1,392 +1,444 @@
 -#include <thread>
 -#include <atomic>
 -#include <cstdio>
@@ -2031,6 +2074,14 @@
 +
 +extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
 +    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    // [wcw2k] DIAGNOSTIC: WM2000's post-attract crash traced to message values landing
++    // in thread 6's stack (func_800E2704's saved-s0 slot 0x80083900 receives retrace/
++    // task-done message values). Log any queue whose ring buffer lands in that region
++    // to identify the creator.
++    if ((uint32_t)msg >= 0x80080000u && (uint32_t)msg < 0x80084000u) {
++        fprintf(stderr, "[wcw2k][mq] osCreateMesgQueue mq=0x%08X BUFFER=0x%08X count=%d (in thread-6 TCB/stack region!)\n",
++            (uint32_t)mq_, (uint32_t)msg, count);
++    }
 +    mq->blocked_on_recv = NULLPTR;
 +    mq->blocked_on_send = NULLPTR;
 +    mq->msgCount = count;
@@ -2165,7 +2216,18 @@
 +extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
 +    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
 +    bool jam = false;
-+    
++
++    // [wcw2k] DIAGNOSTIC: sends into thread 6's upper stack frames (the func_800E2704
++    // saved-s0 slot 0x80083900 corruption — bringup session 5 part 5). Log the target
++    // mq, its ring buffer, and the sender.
++    if (((uint32_t)mq_ >= 0x80083800u && (uint32_t)mq_ < 0x80083A00u) ||
++        ((uint32_t)mq->msg >= 0x80083800u && (uint32_t)mq->msg < 0x80083A00u)) {
++        fprintf(stderr, "[wcw2k][send] mq=0x%08X buf=0x%08X valid=%d msg=0x%08X sender=0x%08X game=%d\n",
++            (uint32_t)mq_, (uint32_t)mq->msg, mq->validCount, (uint32_t)msg,
++            ultramodern::is_game_thread() ? (uint32_t)ultramodern::this_thread() : 0,
++            (int)ultramodern::is_game_thread());
++    }
++
 +    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
 +    if (!ultramodern::is_game_thread()) {
 +        ultramodern::enqueue_external_message(mq_, msg, jam, false);
@@ -2272,6 +2334,51 @@
  // If there's ever any audio popping, check here first. Some games are very sensitive to
  // the remaining sample count and reporting a number that's too high here can lead to issues.
  // Reporting a number that's too low can lead to audio lag in some games.
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/src/events.cpp	2026-07-07 15:35:26.736491600 -0400
++++ lib/N64ModernRuntime/ultramodern/src/events.cpp	2026-07-11 23:26:05.996839800 -0400
+@@ -391,11 +391,42 @@
+             return;
+         }
+ 
++        // [wcw2k] DIAGNOSTIC (WCW2K_TASKWATCH=1): WM2000's corruption family (TCB wipes,
++        // music-slot garbage, thread-6 stack slots — float debris) lives in the audio
++        // heap around 0x80080000-0x80084000. The RSP task thread runs CONCURRENTLY with
++        // the cooperative game threads, so scheduler-touch watchers mis-attribute its
++        // writes. Snapshot the hot windows around each task run to convict or acquit
++        // the recompiled audio ucode directly.
++        static const bool taskwatch = getenv("WCW2K_TASKWATCH") != nullptr;
++        static uint32_t snap[0x60 / 4];
++        static uint32_t tasknum = 0;
++        constexpr uint32_t tcb_off = 0x807C0, frame_off = 0x83900;
++        if (taskwatch) {
++            memcpy(snap, rdram + tcb_off, 0x30);
++            memcpy(snap + 0x30 / 4, rdram + frame_off, 0x30);
++        }
++        tasknum++;
++
+         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
+             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
+             ULTRAMODERN_QUICK_EXIT();
+         }
+ 
++        if (taskwatch) {
++            const uint32_t* now_tcb = (const uint32_t*)(rdram + tcb_off);
++            const uint32_t* now_frm = (const uint32_t*)(rdram + frame_off);
++            for (uint32_t i = 0; i < 0x30 / 4; i++) {
++                if (now_tcb[i] != snap[i]) {
++                    fprintf(stderr, "[wcw2k][taskwatch] task#%u type=%u CHANGED 0x%08X: %08X -> %08X\n",
++                        tasknum, (unsigned)task->t.type, 0x80000000u + tcb_off + i * 4, snap[i], now_tcb[i]);
++                }
++                if (now_frm[i] != snap[0x30 / 4 + i]) {
++                    fprintf(stderr, "[wcw2k][taskwatch] task#%u type=%u CHANGED 0x%08X: %08X -> %08X\n",
++                        tasknum, (unsigned)task->t.type, 0x80000000u + frame_off + i * 4, snap[0x30 / 4 + i], now_frm[i]);
++                }
++            }
++        }
++
+         // Tell the game that the RSP has completed
+         sp_complete();
+     }
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-07 15:35:26.735491600 -0400
 +++ lib/N64ModernRuntime/ultramodern/include/ultramodern/ultramodern.hpp	2026-07-11 22:08:34.663531600 -0400
 @@ -57,6 +57,15 @@

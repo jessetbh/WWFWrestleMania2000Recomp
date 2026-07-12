@@ -868,24 +868,39 @@ functions = [
 ]
 
 [[section]]
+name = "main_3A1D8"
+rom = 0x0003A1D8
+vram = 0x800395D8
+size = 0x2450
+
+functions = [
+    { name = "func_800395D8", vram = 0x800395D8, size = 0x38 },
+    { name = "func_8003B4D0", vram = 0x8003B4D0, size = 0x7C },
+    { name = "func_8003B54C", vram = 0x8003B54C, size = 0xC0 },
+    { name = "func_8003B628", vram = 0x8003B628, size = 0x1C },
+    { name = "func_8003B644", vram = 0x8003B644, size = 0xD0 },
+    { name = "func_8003B720", vram = 0x8003B720, size = 0x28 },
+    { name = "func_8003B748", vram = 0x8003B748, size = 0xA8 },
+]
+
+[[section]]
 name = "main_3C0D0"
 rom = 0x0003C0D0
 vram = 0x8003B4D0
 size = 0x558
 
 functions = [
-    { name = "func_800395D8", vram = 0x800395D8, size = 0x1EF8 },
-    { name = "func_8003B4D0", vram = 0x8003B4D0, size = 0x3C },
+    { name = "func_8003B4D0_main_3C0D0", vram = 0x8003B4D0, size = 0x3C },
     { name = "func_8003B510", vram = 0x8003B510, size = 0x3C },
-    { name = "func_8003B54C", vram = 0x8003B54C, size = 0x44 },
+    { name = "func_8003B54C_main_3C0D0", vram = 0x8003B54C, size = 0x44 },
     { name = "func_8003B590", vram = 0x8003B590, size = 0x1C },
     { name = "func_8003B5B0", vram = 0x8003B5B0, size = 0x5C },
-    { name = "func_8003B628", vram = 0x8003B628, size = 0x1C },
-    { name = "func_8003B644", vram = 0x8003B644, size = 0x3C },
+    { name = "func_8003B628_main_3C0D0", vram = 0x8003B628, size = 0x1C },
+    { name = "func_8003B644_main_3C0D0", vram = 0x8003B644, size = 0x3C },
     { name = "func_8003B680", vram = 0x8003B680, size = 0x28 },
     { name = "func_8003B6A8", vram = 0x8003B6A8, size = 0x6C },
-    { name = "func_8003B720", vram = 0x8003B720, size = 0x28 },
-    { name = "func_8003B748", vram = 0x8003B748, size = 0xA8 },
+    { name = "func_8003B720_main_3C0D0", vram = 0x8003B720, size = 0x28 },
+    { name = "func_8003B748_main_3C0D0", vram = 0x8003B748, size = 0xA8 },
     { name = "func_8003B7F0", vram = 0x8003B7F0, size = 0x24 },
     { name = "func_8003B83C", vram = 0x8003B83C, size = 0x30 },
     { name = "func_8003B86C", vram = 0x8003B86C, size = 0x24 },
@@ -1407,6 +1422,7 @@ functions = [
     { name = "func_8012CCCC", vram = 0x8012CCCC, size = 0x7DC },
     { name = "func_8012D4A8", vram = 0x8012D4A8, size = 0x6BC },
     { name = "func_8012DB64", vram = 0x8012DB64, size = 0x580 },
+    { name = "func_8012DC3C", vram = 0x8012DC3C, size = 0x4A8 },
     { name = "func_8012E0E4", vram = 0x8012E0E4, size = 0x22C },
     { name = "func_8012E310", vram = 0x8012E310, size = 0x204 },
     { name = "func_8012E514", vram = 0x8012E514, size = 0x80 },

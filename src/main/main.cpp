@@ -9,6 +9,7 @@
 #include <array>
 #include <filesystem>
 #include <thread>
+#include <set>
 #include <chrono>
 
 #define SDL_MAIN_HANDLED
@@ -182,6 +183,7 @@ template <typename... Ts>
 // ---------------- gfx / window ----------------
 // These globals are referenced by recompui/recompinput, so they must be non-static.
 SDL_Window* window = nullptr;
+uint8_t* g_ww_rdram = nullptr;   // rdram base for the [wm2k][ww] write-watch diagnostic
 std::vector<recomp::GameEntry> supported_games;
 
 ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
@@ -627,6 +629,12 @@ int main(int argc, char** argv) {
     extern bool wcw_pak_separate_backing;
     wcw_pak_separate_backing = true;
 
+    // Hardware-accurate osAiSetFrequency return (28800 -> 28805 via DAC quantization).
+    // WM2000 sizes its audio-heap allocations from the return value; the unquantized
+    // return shifted the audio heap onto thread 6's stack ([wcw2k] in librecomp ai.cpp).
+    extern bool wcw_ai_accurate_freq;
+    wcw_ai_accurate_freq = true;
+
     recomp::GameEntry game{};
     game.rom_hash = 0x72BBA9F8BC1E7A80ULL;          // XXH3_64bits of the NTSC-U V1.2 ROM
     game.internal_name = "WRESTLEMANIA 2000";
@@ -772,6 +780,8 @@ game.save_type = recomp::SaveType::Sram;
         .create_render_context = [](uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode)
             -> std::unique_ptr<ultramodern::renderer::RendererContext> {
             fprintf(stderr, "[wcw] create_render_context (RT64)...\n");
+            extern uint8_t* g_ww_rdram;          // write-watch diag ([wm2k][ww] block below)
+            g_ww_rdram = rdram;
             try {
                 // Console presentation mode, NOT PresentEarly (which BMHero uses). PresentEarly
                 // fires a present the moment a workload writes any previously-displayed
@@ -827,6 +837,66 @@ game.save_type = recomp::SaveType::Sram;
         std::thread([wcwSampleDelay]() {
             std::this_thread::sleep_for(std::chrono::seconds(wcwSampleDelay));
             wcw_sample_all_threads();
+        }).detach();
+    }
+#endif
+
+#ifdef _WIN32
+    // [wm2k diag] WCW2K_WRITEWATCH=<vram hex>: hardware watchpoint (DR0, 4-byte write) on an
+    // rdram word, applied to every thread in the process by a poller. Catches the exact host
+    // RIP of whoever writes the word — built for the deterministic post-attract crash where
+    // func_800E2704's saved-s0 stack slot (0x80083900) is stomped with 1 by an actor every
+    // indirect probe (mesg sends, RSP tasks, scheduler clients, fb clears) has acquitted.
+    // Symbolize logged RIPs offline: rip - base == the Wm2kRecompiled+0x... offset used by
+    // tools/annotate_stacks.py.
+    if (const char* ww = getenv("WCW2K_WRITEWATCH")) {
+        fprintf(stderr, "[wm2k][ww] armed, target vram %s\n", ww);
+        static uint32_t ww_vram = (uint32_t)strtoul(ww, nullptr, 16);
+        static volatile uint32_t* ww_word = nullptr;
+        AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+            if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+                uint64_t base = (uint64_t)GetModuleHandleA(nullptr);
+                uint64_t rip = ep->ContextRecord->Rip;
+                fprintf(stderr, "[wm2k][ww] watch hit: rip=Wm2kRecompiled+0x%llX tid=%lu value_now=%08X\n",
+                    (unsigned long long)(rip - base), GetCurrentThreadId(), ww_word ? *ww_word : 0);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        });
+        std::thread([]() {
+            // rdram pointer is stashed by the create_render_context callback.
+            extern uint8_t* g_ww_rdram;
+            while (g_ww_rdram == nullptr) { Sleep(100); }
+            uint8_t* rdram_base = g_ww_rdram;
+            uint64_t watch_addr = (uint64_t)(rdram_base + (ww_vram - 0x80000000u));
+            ww_word = (volatile uint32_t*)watch_addr;
+            fprintf(stderr, "[wm2k][ww] watching vram 0x%08X at host %p\n", ww_vram, (void*)watch_addr);
+            std::set<DWORD> armed;
+            const DWORD self = GetCurrentThreadId();
+            while (true) {
+                HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (snap != INVALID_HANDLE_VALUE) {
+                    THREADENTRY32 te{ sizeof(te) };
+                    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self) continue;
+                        if (armed.count(te.th32ThreadID)) continue;
+                        HANDLE th = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                        if (!th) continue;
+                        if (SuspendThread(th) != (DWORD)-1) {
+                            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                            if (GetThreadContext(th, &c)) {
+                                c.Dr0 = watch_addr;
+                                c.Dr7 = (c.Dr7 & ~0xF0003ull) | 0x1 | (0b01ull << 16) | (0b11ull << 18); // local DR0, write, 4 bytes
+                                if (SetThreadContext(th, &c)) armed.insert(te.th32ThreadID);
+                            }
+                            ResumeThread(th);
+                        }
+                        CloseHandle(th);
+                    }
+                    CloseHandle(snap);
+                }
+                Sleep(300);
+            }
         }).detach();
     }
 #endif
