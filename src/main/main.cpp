@@ -620,6 +620,13 @@ int main(int argc, char** argv) {
     // Register the game. The entry is stored in the global `supported_games` vector because
     // recompui's launcher reads supported_games[0] (e.g. default_launcher_init_callback) to
     // build the game-options menu; leaving it empty access-violates during boot.
+    // WM2000 saves to cart SRAM AND uses the Controller Pak (created wrestlers). librecomp's
+    // pak emulation historically shared the 32KB cart-save buffer (fine for WCW/Revenge,
+    // which are pak-only) — here that would let pak writes corrupt the SRAM save, so give
+    // the pak its own image (saves/<game id>.pak.bin, [wcw2k] in librecomp si.cpp).
+    extern bool wcw_pak_separate_backing;
+    wcw_pak_separate_backing = true;
+
     recomp::GameEntry game{};
     game.rom_hash = 0x72BBA9F8BC1E7A80ULL;          // XXH3_64bits of the NTSC-U V1.2 ROM
     game.internal_name = "WRESTLEMANIA 2000";

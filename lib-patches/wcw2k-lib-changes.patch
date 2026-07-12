@@ -122,6 +122,146 @@
  }
  
  void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+--- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/si.cpp	2026-07-07 15:35:26.724634500 -0400
++++ lib/N64ModernRuntime/librecomp/src/si.cpp	2026-07-11 22:29:48.353653200 -0400
+@@ -21,6 +21,7 @@
+ #include <cstring>
+ 
+ #include "helpers.hpp"
++#include "librecomp/files.hpp"
+ 
+ #define MAXCONTROLLERS 4
+ 
+@@ -35,6 +36,83 @@
+ void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
+ void save_read_ptr(void* out, uint32_t offset, uint32_t count);
+ 
++// [wcw2k] Separate Controller Pak backing. Sharing the save buffer is only safe when the
++// game never writes cart SRAM (WCW/Revenge: pak-only saves). WM2000 saves to cart SRAM
++// AND uses the pak (created wrestlers) — sharing would let the first pak write corrupt the
++// cart save. Projects where both coexist set this true (before boot); the pak then lives
++// in its own 32 KB image persisted next to the save file as <save name>.pak.bin with the
++// same atomic backup scheme. Default false keeps WT/Revenge byte-identical.
++bool wcw_pak_separate_backing = false;
++static uint8_t wcw2k_pak_buffer[0x8000];
++static bool wcw2k_pak_loaded = false;
++static bool wcw2k_pak_dirty = false;
++
++static std::filesystem::path wcw2k_pak_file_path() {
++    std::filesystem::path p = ultramodern::get_save_file_path();
++    p.replace_extension(".pak.bin");
++    return p;
++}
++
++static void wcw2k_pak_ensure_loaded() {
++    if (wcw2k_pak_loaded) { return; }
++    wcw2k_pak_loaded = true;
++    std::ifstream f = recomp::open_input_file_with_backup(wcw2k_pak_file_path(), std::ios_base::binary);
++    if (f.good()) {
++        f.read(reinterpret_cast<char*>(wcw2k_pak_buffer), sizeof(wcw2k_pak_buffer));
++        fprintf(stderr, "[wcw2k][pak] loaded pak image (%lld bytes)\n", (long long)f.gcount());
++    }
++    else {
++        fprintf(stderr, "[wcw2k][pak] no pak image yet - starting blank\n");
++    }
++}
++
++// Pak data-region accessors: route to the dedicated image when separated, else to the
++// shared save buffer (legacy WT/Revenge behavior).
++static void wcw_pak_read(void* out, uint32_t offset, uint32_t count) {
++    if (wcw_pak_separate_backing) {
++        wcw2k_pak_ensure_loaded();
++        memcpy(out, wcw2k_pak_buffer + offset, count);
++    }
++    else {
++        save_read_ptr(out, offset, count);
++    }
++}
++
++static void wcw_pak_write(const void* in, uint32_t offset, uint32_t count) {
++    if (wcw_pak_separate_backing) {
++        wcw2k_pak_ensure_loaded();
++        memcpy(wcw2k_pak_buffer + offset, in, count);
++        wcw2k_pak_dirty = true;
++    }
++    else {
++        save_write_ptr(in, offset, count);
++    }
++}
++
++// Flush once per joybus block (not per 32-byte write): a game save is a burst of block
++// writes across a few frames, so this coalesces to a handful of 32 KB file writes.
++static void wcw2k_pak_flush() {
++    if (!wcw2k_pak_dirty) { return; }
++    wcw2k_pak_dirty = false;
++    std::filesystem::path path = wcw2k_pak_file_path();
++    bool failed = false;
++    {
++        std::ofstream f = recomp::open_output_file_with_backup(path, std::ios_base::binary);
++        if (f.good()) {
++            f.write(reinterpret_cast<const char*>(wcw2k_pak_buffer), sizeof(wcw2k_pak_buffer));
++        }
++        else {
++            failed = true;
++        }
++    }
++    if (!failed) {
++        failed = !recomp::finalize_output_file_with_backup(path);
++    }
++    if (failed) {
++        fprintf(stderr, "[wcw2k][pak] FAILED to write pak image %s\n", path.string().c_str());
++    }
++}
++
+ // [wcw] Hybrid pak identity for rumble support. A real N64 has ONE pak slot per controller:
+ // WCW saves to the Controller Pak but also supports the Rumble Pak ("Insert a Rumble Pak
+ // now" prompt at the title), and on hardware the player physically swaps them. Our virtual
+@@ -77,7 +155,7 @@
+ 
+     uint8_t page[256];
+     for (uint32_t off = 0; off < 0x8000; off += (uint32_t)sizeof(page)) {
+-        save_read_ptr(page, off, (uint32_t)sizeof(page));
++        wcw_pak_read(page, off, (uint32_t)sizeof(page));
+         for (size_t b = 0; b < sizeof(page); b++) {
+             if (page[b] != 0) { return; }        // save has data — leave it alone
+         }
+@@ -117,7 +195,7 @@
+     inode[1] = csum;
+     memcpy(&pages[0x200], inode, 256);
+ 
+-    save_write_ptr(pages, 0, (uint32_t)sizeof(pages));
++    wcw_pak_write(pages, 0, (uint32_t)sizeof(pages));
+     fprintf(stderr, "[wcw][pak] fresh save image - formatted empty Controller Pak filesystem\n");
+ }
+ 
+@@ -210,7 +288,7 @@
+             uint32_t offset = addr & 0xFFE0u;
+             if (offset < 0x8000) {
+                 wcw_pak_ensure_formatted();
+-                save_read_ptr(res, offset, 32);          // pak RAM <- save buffer
++                wcw_pak_read(res, offset, 32);           // pak RAM <- pak backing
+             }
+             else {
+                 // Bank/ID region: answer with the current pak identity — 0x80s is the Rumble
+@@ -230,7 +308,7 @@
+             const uint8_t* data = &pif_ram[i + 5];
+             if (offset < 0x8000) {
+                 wcw_pak_ensure_formatted();              // format first so the game's write wins
+-                save_write_ptr(data, offset, 32);        // persists asynchronously (librecomp)
++                wcw_pak_write(data, offset, 32);         // persists on block completion (below)
+             }
+             else if (offset >= 0xC000) {
+                 // Rumble Pak motor command: a block of 0x01s starts the motor, 0x00s stops it.
+@@ -267,6 +345,9 @@
+         i += 2 + t + rx;
+         channel++;
+     }
++
++    // [wcw2k] Persist any pak writes this block produced (no-op unless separated + dirty).
++    wcw2k_pak_flush();
+ }
+ 
+ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
 --- /c/Users/selki/depot/WcwRevengeRecomp/lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-07 15:35:26.717619900 -0400
 +++ lib/N64ModernRuntime/librecomp/src/ai.cpp	2026-07-11 22:09:04.367521000 -0400
 @@ -28,5 +28,12 @@
