@@ -1,0 +1,45 @@
+--- ../WcwRevengeRecomp/lib/rt64/src/hle/rt64_rsp.cpp	2026-07-12 21:55:17.484398800 -0400
++++ lib/rt64/src/hle/rt64_rsp.cpp	2026-07-12 22:07:49.467359900 -0400
+@@ -435,8 +435,12 @@
+                 prev = cur;
+                 const uint32_t c = ++wcw2kChg[rdramAddress];
+                 if (c <= 8 || (c & 0xFF) == 0) {
+-                    fprintf(stderr, "[wcw2k][vtx] addr=0x%08X n=%u dst=%u xyz0=(%d,%d,%d) chg=%u\n",
+-                            rdramAddress, vtxCount, dstIndex, cur[0], cur[1], cur[2], c);
++                    // mvp pairing: which transform is active for THIS load (identity =
++                    // the engine's CPU-projected screen-space path).
++                    fprintf(stderr, "[wcw2k][vtx] addr=0x%08X n=%u dst=%u xyz0=(%d,%d,%d) chg=%u mvpt=(%.1f,%.1f,%.1f) mvpd=(%.3f,%.3f,%.3f)\n",
++                            rdramAddress, vtxCount, dstIndex, cur[0], cur[1], cur[2], c,
++                            (float)modelViewProjMatrix[3][0], (float)modelViewProjMatrix[3][1], (float)modelViewProjMatrix[3][2],
++                            (float)modelViewProjMatrix[0][0], (float)modelViewProjMatrix[1][1], (float)modelViewProjMatrix[2][2]);
+                 }
+             }
+         }
+--- ../WcwRevengeRecomp/lib/rt64/src/gbi/rt64_gbi_f3dex2.cpp	2026-07-07 15:35:30.407516000 -0400
++++ lib/rt64/src/gbi/rt64_gbi_f3dex2.cpp	2026-07-12 21:56:02.377952900 -0400
+@@ -5,6 +5,7 @@
+ #include "rt64_gbi_f3dex2.h"
+ 
+ #include <cassert>
++#include <cstdio>
+ 
+ #include "../include/rt64_extended_gbi.h"
+ #include "hle/rt64_interpreter.h"
+@@ -55,6 +56,17 @@
+                 break;
+             }
+             default:
++                // [wcw2k] release builds compile the assert out, silently dropping any
++                // ucode-custom moveMem index (suspect for WM2000's in-match rope
++                // placement). Log loudly, rate-limited.
++                {
++                    static int wcw2kMoveMemN[256] = {};
++                    const int c = ++wcw2kMoveMemN[index];
++                    if (c <= 16 || (c & 0xFF) == 0) {
++                        fprintf(stderr, "[wcw2k][movemem] UNIMPLEMENTED index=0x%02X ofs=0x%02X w1=0x%08X n=%d\n",
++                                index, (*dl)->p0(8, 8), (*dl)->w1, c);
++                    }
++                }
+                 assert(false && "Unimplemented moveMem command");
+                 break;
+             }

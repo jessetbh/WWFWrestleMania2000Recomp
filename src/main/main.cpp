@@ -859,6 +859,29 @@ game.save_type = recomp::SaveType::Sram;
                 uint64_t rip = ep->ContextRecord->Rip;
                 fprintf(stderr, "[wm2k][ww] watch hit: rip=Wm2kRecompiled+0x%llX tid=%lu value_now=%08X\n",
                     (unsigned long long)(rip - base), GetCurrentThreadId(), ww_word ? *ww_word : 0);
+                // [wm2k diag] host backtrace for the first hits: recomp functions are real
+                // host functions, so the return-address chain IS the game call chain
+                // (symbolize each Wm2kRecompiled+0x offset against the .map). Needed for
+                // the rope-matrix hunt: the RIP alone landed in guMtxF2L (a leaf converter);
+                // the culprit is the caller that hands it an identity float matrix.
+                static volatile long ww_bt_n = 0;
+                if (InterlockedIncrement(&ww_bt_n) <= 12) {
+                    CONTEXT c = *ep->ContextRecord;
+                    for (int i = 0; i < 14 && c.Rip; i++) {
+                        if (c.Rip >= base && c.Rip < base + 0x10000000ull)
+                            fprintf(stderr, "[wm2k][ww]   bt[%d]=Wm2kRecompiled+0x%llX\n", i, (unsigned long long)(c.Rip - base));
+                        DWORD64 imgBase = 0;
+                        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &imgBase, nullptr);
+                        if (fe == nullptr) { // leaf frame: return address sits at Rsp
+                            c.Rip = *(DWORD64*)c.Rsp;
+                            c.Rsp += 8;
+                            continue;
+                        }
+                        PVOID handlerData = nullptr;
+                        DWORD64 establisher = 0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgBase, c.Rip, fe, &c, &handlerData, &establisher, nullptr);
+                    }
+                }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             return EXCEPTION_CONTINUE_SEARCH;
