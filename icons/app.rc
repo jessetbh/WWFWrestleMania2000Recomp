@@ -8,11 +8,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "WCW/nWo Revenge: Recompiled"
+            VALUE "FileDescription", "WWF WrestleMania 2000: Recompiled"
             VALUE "FileVersion", "0.1.0"
-            VALUE "InternalName", "RevengeRecompiled"
-            VALUE "OriginalFilename", "RevengeRecompiled.exe"
-            VALUE "ProductName", "WCW/nWo Revenge: Recompiled"
+            VALUE "InternalName", "Wm2kRecompiled"
+            VALUE "OriginalFilename", "Wm2kRecompiled.exe"
+            VALUE "ProductName", "WWF WrestleMania 2000: Recompiled"
             VALUE "ProductVersion", "0.1.0"
         END
     END
