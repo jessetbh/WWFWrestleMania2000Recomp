@@ -187,10 +187,34 @@ def do_funcs_0():
     uint64_t wm2k_sp_in = ctx->r29;''', 'funcs_0 870')
     save_lines('funcs_0.c', lines)
 
+# ---------------- funcs_7.c : rope evaluator probe ----------------
+def do_funcs_7():
+    lines, _ = add_stdio('funcs_7.c', 'for the rope probe')
+    if any('[wm2k][rope]' in l for l in lines):
+        save_lines('funcs_7.c', lines); return
+    rng = body_range(lines, 'func_8001DD50')
+    lo, hi = rng
+    if lo is None:
+        return
+    ok = insert_after(lines, (lo, min(lo + 4, hi)), '    int c1cs = 0;', lf(
+'''    { /* [wm2k HAND-EDIT ropeprobe] rope strip evaluator: log dest buffer, rope
+         index and caller for the first calls + first calls after each 4096
+         (session 8 part 4 rope hunt; garbage strips = dest 0x33C5D0..0x33C990). */
+        static unsigned wm2k_rope_n = 0;
+        unsigned n = ++wm2k_rope_n;
+        if (n <= 120 || (n & 0xFFF) < 24)
+            fprintf(stderr, "[wm2k][rope] dest=0x%08X idx=%d ra=0x%08X n=%u\\n",
+                (unsigned)ctx->r4, (int)(int32_t)ctx->r5, (unsigned)ctx->r31, n);
+    }'''), 'funcs_7 ropeprobe')
+    if ok:
+        save_lines('funcs_7.c', lines)
+        print('funcs_7.c: rope probe re-added')
+
 do_funcs_1()
 do_funcs_21()
 do_funcs_8()
 do_funcs_0()
+do_funcs_7()
 
 if failures:
     print('\nFAILURES:')

@@ -93,7 +93,7 @@ for path in sorted(glob.glob(os.path.join(ROOT, 'RecompiledFuncs', 'funcs_*.c'))
                 dec = '    // 0x%08X:' % t
                 if dec in newbody:
                     lbl = 'L_%08X' % t
-                    if (re.search(r'^%s:$' % lbl, newbody, re.M) is None
+                    if (re.search(r'^%s:\r?$' % lbl, newbody, re.M) is None
                             and lbl not in [l for _, l in label_adds]):
                         n_top = newbody.count('\n' + dec)
                         if n_top != 1:

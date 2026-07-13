@@ -23,6 +23,7 @@ stubs = [
     "func_80032A50",
     "func_80036780",
     "func_80036CC4",
+    "func_80036CDC",
     "func_80036DFC",
     "func_80036F64",
     "func_80037680",
