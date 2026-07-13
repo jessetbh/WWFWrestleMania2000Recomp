@@ -107,6 +107,13 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c ${CMAKE_CURRE
     DEPENDS ${CMAKE_SOURCE_DIR}/icons/app.png file_to_c
 )
 target_sources(Wm2kRecompiled PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/icon_bytes.c)
+# Game logo for the recompui launcher menu (replaces the default text title; see
+# register_launcher_init_callback in src/main/main.cpp — mirrors World Tour).
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.h
+    COMMAND file_to_c ${CMAKE_SOURCE_DIR}/icons/logo.png logo_bytes ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.h
+    DEPENDS ${CMAKE_SOURCE_DIR}/icons/logo.png file_to_c
+)
+target_sources(Wm2kRecompiled PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/logo_bytes.c)
 if (WIN32)
     enable_language(RC)
     target_sources(Wm2kRecompiled PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
