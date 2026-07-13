@@ -1795,6 +1795,7 @@ functions = [
     { name = "func_8016CC98", vram = 0x8016CC98, size = 0x3C },
     { name = "func_8016CCD4", vram = 0x8016CCD4, size = 0x1C },
     { name = "func_8016CCF0", vram = 0x8016CCF0, size = 0x88 },
+    { name = "func_8016CD08", vram = 0x8016CD08, size = 0x70 },
     { name = "func_8016CD78", vram = 0x8016CD78, size = 0x4C },
     { name = "func_8016CDCC", vram = 0x8016CDCC, size = 0x1C },
     { name = "func_8016CDF0", vram = 0x8016CDF0, size = 0x54 },

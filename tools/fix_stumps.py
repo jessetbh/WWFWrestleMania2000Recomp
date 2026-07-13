@@ -8,10 +8,18 @@ a few instructions, then the C body just ends -- returning early without the
 original tail (skipping logic AND the stack restore; this class caused the
 boot84 saved-s0 corruption).
 
-For every RECOMP_FUNC body that does not end in a `return;`, look up the
-same-section function starting at (last decoded address + 4) and append a
-tail-call to it. Run after every tools/recomp_loop.py invocation (see CLAUDE.md
-build loop).
+For every RECOMP_FUNC body whose END is REACHABLE (control flow can fall off
+the closing brace), look up the same-section function starting at (last decoded
+address + 4) and append a tail-call to it. Run after every tools/recomp_loop.py
+invocation (see CLAUDE.md build loop).
+
+Reachability, not "does the tail contain a return": the match-exit -0x18 stack
+leak (boot91, session 7) was func_80009B7C, whose truncated fall-off sits right
+AFTER a label (L_80009BEC) that follows another exit path's `return;` -- the old
+last-8-lines heuristic saw that return and skipped the stump. Rule: walk the
+body at brace depth 0; `return;`/`goto` kill the flow, any label revives it
+(labels are goto targets); if the flow is alive at the closing brace, the
+function falls off the end and must be chained.
 """
 import re, glob, sys, os
 
@@ -30,14 +38,31 @@ for m in re.finditer(r'\{ name = "(\w+)", vram = (0x[0-9A-Fa-f]+)', dump):
     name2sec[m.group(1)] = sec
     by_sec_vram[(sec, int(m.group(2), 16))] = m.group(1)
 
+label_re = re.compile(r'(?:after_\d+|L_[0-9A-Fa-f]{8}):$')
+
+def end_reachable(body):
+    """True if control flow can fall off the end of a generated C body."""
+    reachable = True
+    depth = 0
+    for raw in body.split('\n'):
+        s = raw.strip()
+        if not s or s.startswith('//') or s.startswith('/*') or s.startswith('*'):
+            continue
+        if depth == 0:
+            if label_re.match(s):
+                reachable = True   # a goto target: flow can resume here
+            elif reachable and (s == 'return;' or s.startswith('goto ')):
+                reachable = False  # unconditional exit at function level
+        depth += s.count('{') - s.count('}')
+    return reachable
+
 fixed = 0
 for path in sorted(glob.glob(os.path.join(ROOT, 'RecompiledFuncs', 'funcs_*.c'))):
     src = open(path, 'rb').read().decode('utf-8', errors='replace')
     out = src
     for m in re.finditer(r'RECOMP_FUNC void (\w+)\(uint8_t\* rdram, recomp_context\* ctx\) \{(.*?)(^;\})', src, re.S | re.M):
         name, body, close = m.group(1), m.group(2), m.group(3)
-        tail_lines = [x for x in body.rstrip().split('\n')[-8:]]
-        if any('return;' in x for x in tail_lines):
+        if not end_reachable(body):
             continue
         addrs = re.findall(r'// (0x[0-9A-F]{8}):', body)
         if not addrs:
