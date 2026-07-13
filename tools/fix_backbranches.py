@@ -19,11 +19,22 @@ syms/extra_funcs.txt + regen; their truncated decodes are then completed by
 tools/fix_stumps.py chaining and, recursively, by this script).
 
 Run AFTER fix_stumps.py + fix_switches.py, every regen. Idempotent.
-"""
-import re, os, glob, sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-dump = open(os.path.join(ROOT, 'syms', 'dump.toml'), encoding='utf-8').read()
+Portable to the sister recomps (same generated-code shape):
+  python tools/fix_backbranches.py --audit --root ..\\WcwRevengeRecomp
+  python tools/fix_backbranches.py --audit --root ..\\WcwNwoWorldTour --dump ..\\WcwNwoWorldTour\\WCWSyms\\dump.toml
+--audit reports without modifying any file (use for repos you don't own the
+build loop of); default (no flags) = fix in place for THIS repo.
+"""
+import re, os, glob, sys, argparse
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--root', default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ap.add_argument('--dump', default=None, help='dump.toml path (default <root>/syms/dump.toml)')
+ap.add_argument('--audit', action='store_true', help='report only, do not modify files')
+args = ap.parse_args()
+ROOT = args.root
+dump = open(args.dump or os.path.join(ROOT, 'syms', 'dump.toml'), encoding='utf-8').read()
 
 sec_positions = [(m.start(), m.group(1)) for m in re.finditer(r'^name = "(\w+)"', dump, re.M)]
 name2sec, funcs_by_sec = {}, {}
@@ -96,7 +107,7 @@ for path in sorted(glob.glob(os.path.join(ROOT, 'RecompiledFuncs', 'funcs_*.c'))
             fixed += n
         if newbody != body:
             out = out.replace(fm.group(0), fm.group(0).replace(body, newbody, 1), 1)
-    if out != src:
+    if out != src and not args.audit:
         open(path, 'wb').write(out.encode('utf-8'))
 print('%d gotos fixed, %d missing mid-entries' % (fixed, missing))
 sys.exit(1 if missing else 0)
