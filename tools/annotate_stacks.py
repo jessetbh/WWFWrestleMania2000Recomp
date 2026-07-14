@@ -1,7 +1,7 @@
 import re, sys, bisect
 from pathlib import Path
 
-MAP = Path(r"C:\Users\selki\depot\Wm2kRecomp\build-msvc\Wm2kRecompiled.map")
+MAP = Path(__file__).resolve().parent.parent / "build-msvc" / "Wm2kRecompiled.map"
 BASE = 0x140000000
 SYM_RE = re.compile(r"^\s*[0-9a-f]{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{16})\s", re.IGNORECASE)
 FRAME_RE = re.compile(r"Wm2kRecompiled\+0x([0-9A-Fa-f]+)")
