@@ -44,11 +44,6 @@ file_to_c.exe
 *.v64
 wm2k.z64
 
-# Runtime libraries: BOOTSTRAP SNAPSHOT of the jessetbh fork wcw branches, copied
-# from WcwRevengeRecomp's submodule checkouts (pins recorded in CLAUDE.md).
-# Convert to proper submodules before any publication (WT's playbook).
-lib/
-
 # Disassembly project — generated/large; keep configs + symbol files only
 disasm/.venv/
 disasm/asm/
@@ -85,5 +80,6 @@ boot*.err.log
 probe*.log
 probe*.err.log
 recomp-out.txt
+boot*_stacks*.txt
 boot-screenshot.png
 shot-*.png
