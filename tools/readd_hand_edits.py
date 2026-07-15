@@ -70,6 +70,11 @@ def add_stdio(fn, why):
 def lf(block):
     return [l + '\n' for l in block.split('\n')]
 
+def add_header(lines, header, why):
+    """Prepend an extra #include (e.g. stdlib.h for getenv) if missing."""
+    if not any(('#include <%s>' % header) in l for l in lines):
+        lines.insert(0, '#include <%s>  /* [wm2k HAND-EDIT] %s */\n' % (header, why))
+
 # ---------------- funcs_1.c : invalid-music-id trap canary ----------------
 def do_funcs_1():
     lines, _ = add_stdio('funcs_1.c', 'for the trap canary')
@@ -86,6 +91,7 @@ def do_funcs_1():
 # ---------------- funcs_21.c : music service trace ----------------
 def do_funcs_21():
     lines, _ = add_stdio('funcs_21.c', 'for the music trace')
+    add_header(lines, 'stdlib.h', 'getenv for the WCW_TRACE gate')
     if any('[wm2k][music]' in l for l in lines):
         save_lines('funcs_21.c', lines); return
     rng = body_range(lines, 'func_800F53C8')
@@ -100,10 +106,12 @@ def do_funcs_21():
         failures.append('funcs_21: 0x800F5408 anchor missing')
         return
     lines[idx + 1:idx + 1] = lf(
-'''    /* [wm2k diag] music-start tracing (hand-edit, dies on regen) */
-    fprintf(stderr, "[wm2k][music] f53C8 sp=0x%08X slot=%d s0=0x%08X cur2E6=%d nxt2E8=%d st2FC=0x%08X arg2FE=0x%04X\\n",
+'''    /* [wm2k diag] music-start tracing (hand-edit, dies on regen; opt-in WCW_TRACE=1 --
+       it prints every service tick and would flood user logs) */
+    { static int wm2k_trace = -1; if (wm2k_trace < 0) wm2k_trace = getenv("WCW_TRACE") != NULL;
+      if (wm2k_trace) fprintf(stderr, "[wm2k][music] f53C8 sp=0x%08X slot=%d s0=0x%08X cur2E6=%d nxt2E8=%d st2FC=0x%08X arg2FE=0x%04X\\n",
             (unsigned)ctx->r29, (int)(int16_t)ctx->r18, (unsigned)ctx->r16, (int)(int16_t)MEM_H(0X2E6, ctx->r16),
-            (int)(int16_t)MEM_H(0X2E8, ctx->r16), (unsigned)MEM_W(0X2FC, ctx->r16), (unsigned)(uint16_t)MEM_HU(0X2FE, ctx->r16));''')
+            (int)(int16_t)MEM_H(0X2E8, ctx->r16), (unsigned)MEM_W(0X2FC, ctx->r16), (unsigned)(uint16_t)MEM_HU(0X2FE, ctx->r16)); }''')
     save_lines('funcs_21.c', lines)
     print('funcs_21.c: music trace re-added')
 
@@ -190,6 +198,7 @@ def do_funcs_0():
 # ---------------- funcs_7.c : rope evaluator probe ----------------
 def do_funcs_7():
     lines, _ = add_stdio('funcs_7.c', 'for the rope probe')
+    add_header(lines, 'stdlib.h', 'getenv for the WCW_TRACE gate')
     if any('[wm2k][rope]' in l for l in lines):
         save_lines('funcs_7.c', lines); return
     rng = body_range(lines, 'func_8001DD50')
@@ -199,10 +208,13 @@ def do_funcs_7():
     ok = insert_after(lines, (lo, min(lo + 4, hi)), '    int c1cs = 0;', lf(
 '''    { /* [wm2k HAND-EDIT ropeprobe] rope strip evaluator: log dest buffer, rope
          index and caller for the first calls + first calls after each 4096
-         (session 8 part 4 rope hunt; garbage strips = dest 0x33C5D0..0x33C990). */
+         (session 8 part 4 rope hunt; garbage strips = dest 0x33C5D0..0x33C990).
+         Opt-in via WCW_TRACE=1 -- the trickle would land in user logs. */
+        static int wm2k_trace = -1;
         static unsigned wm2k_rope_n = 0;
         unsigned n = ++wm2k_rope_n;
-        if (n <= 120 || (n & 0xFFF) < 24)
+        if (wm2k_trace < 0) wm2k_trace = getenv("WCW_TRACE") != NULL;
+        if (wm2k_trace && (n <= 120 || (n & 0xFFF) < 24))
             fprintf(stderr, "[wm2k][rope] dest=0x%08X idx=%d ra=0x%08X n=%u\\n",
                 (unsigned)ctx->r4, (int)(int32_t)ctx->r5, (unsigned)ctx->r31, n);
     }'''), 'funcs_7 ropeprobe')
