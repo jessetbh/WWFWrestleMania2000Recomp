@@ -536,6 +536,10 @@ int main(int argc, char** argv) {
     // Set before anything that resolves the app folder (logging below, config path later).
     recompui::programconfig::set_program_name("WWF WrestleMania 2000: Recompiled");
     recompui::programconfig::set_program_id(u8"Wm2kRecompiled");
+    // [wcw hfr] 60fps frame interpolation: hooks in the camera multiply (hfr_hand_edits) give camera-independent object matrices.
+    recompui::programconfig::FrameInterpolation frame_interpolation{};
+    frame_interpolation.smooth_rate = 60;
+    recompui::programconfig::set_frame_interpolation(frame_interpolation);
 
 #ifdef _WIN32
     wcw_setup_logging(show_console);
