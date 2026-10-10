@@ -127,6 +127,7 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/src/main/main.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/raytracing.cpp
     ${CMAKE_SOURCE_DIR}/rsp/wm2k_audio.cpp
 )
 target_include_directories(Wm2kRecompiled PRIVATE
