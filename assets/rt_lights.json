@@ -128,9 +128,21 @@
             "glows": [[0, 650, 1350, 0.7, 900, 0.55, 0.65, 1.0], [-400, 150, 1300, 1.6, 700, 0.75, 0.6, 1.0], [400, 150, 1300, 1.6, 700, 0.75, 0.6, 1.0]]
         },
         {
+            // SummerSlam: warm white truss rig. Set wall ~z 1500 with the red SS logo over a gate and six purple star lamps:
+            // red logo glow, purple washes on the side walls, red glow along the carpet.
             "name": "SummerSlam",
             "match": ["8677D9DB2BB44504", "6728952E65458980", "05C89F610A7F4068", "EFA5CC2E82C9D7A6", "836869130E281A8D",
-                      "5CFE328F8B5AF73D", "49836AB54CCA55FC"]
+                      "5CFE328F8B5AF73D", "49836AB54CCA55FC"],
+            "lights": [[0, 1000, 0, 3], [-420, 950, -420, 1], [420, 950, -420, 1], [-420, 950, 420, 1], [420, 950, 420, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [1.0, 0.95, 0.9],
+            "outsideDarkness": 0.6,
+            "outsideEdge": 500,
+            "litAreas": [[0, 1350, 700, 450]],
+            "glows": [[0, 450, 1300, 2.6, 900, 1.0, 0.15, 0.1], [-380, 300, 1300, 2.2, 700, 0.75, 0.55, 1.0], [380, 300, 1300, 2.2, 700, 0.75, 0.55, 1.0], [0, 60, 950, 1.6, 700, 1.0, 0.2, 0.15]]
         }
     ]
 }
