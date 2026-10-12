@@ -111,9 +111,21 @@
             "glows": [[-330, 380, 1250, 3.0, 750, 1.0, 0.5, 0.12, 0.25], [330, 380, 1250, 3.0, 750, 1.0, 0.5, 0.12, 0.25], [0, 550, 1400, 1.6, 650, 1.0, 0.1, 0.05], [0, 150, 1150, 2.0, 800, 0.25, 0.4, 1.0]]
         },
         {
+            // WrestleMania (2000): neutral white truss rig, lighter arena (0.5). Chrome 2000 logo on a blue light wall
+            // (~z 1350): a soft cool glow on the logo (it clips easily), purple lamps at the foot of the set.
             "name": "WrestleMania",
             "match": ["B361B9B636E5519E", "9D008205017FD0AA", "EFF6907D0EDC1CBC", "590CEB7FD316698A", "5F23C50770516630",
-                      "7317A77CED15F7B0", "F713DB8325933C30", "70821A13A8CF529D", "8E8388A85E3FBE61", "B0FF33B55F047AE5"]
+                      "7317A77CED15F7B0", "F713DB8325933C30", "70821A13A8CF529D", "8E8388A85E3FBE61", "B0FF33B55F047AE5"],
+            "lights": [[0, 1000, 0, 3], [-420, 950, -420, 1], [420, 950, -420, 1], [-420, 950, 420, 1], [420, 950, 420, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [1.0, 1.0, 1.0],
+            "outsideDarkness": 0.5,
+            "outsideEdge": 550,
+            "litAreas": [[0, 1350, 700, 450]],
+            "glows": [[0, 650, 1350, 0.7, 900, 0.55, 0.65, 1.0], [-400, 150, 1300, 1.6, 700, 0.75, 0.6, 1.0], [400, 150, 1300, 1.6, 700, 0.75, 0.6, 1.0]]
         },
         {
             "name": "SummerSlam",
