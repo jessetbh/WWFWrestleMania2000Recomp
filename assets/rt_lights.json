@@ -28,8 +28,22 @@
     },
     "venues": [
         {
+            // Raw is War: lighting truss ~1000 over the ring (key + four lamps over the corners at +-420), cool white TV
+            // light, spotlit ring (outside darkness 0.55). The entrance set at +Z (stage face ~z 2400): red RAW IS WAR
+            // titantron washing the stage red, white-blue lamps at the foot of the two truss towers; lit area keeps it
+            // out of the darkness.
             "name": "Raw is War",
-            "match": ["DCDF0F234825E436", "D338454D9F6E9768"]
+            "match": ["DCDF0F234825E436", "D338454D9F6E9768"],
+            "lights": [[0, 1000, 0, 3], [-420, 950, -420, 1], [420, 950, -420, 1], [-420, 950, 420, 1], [420, 950, 420, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [0.95, 0.97, 1.0],
+            "outsideDarkness": 0.55,
+            "outsideEdge": 500,
+            "litAreas": [[0, 2100, 800, 500]],
+            "glows": [[0, 700, 2150, 2.0, 1300, 1.0, 0.2, 0.15], [-600, 350, 1750, 2.0, 1000, 0.8, 0.88, 1.0], [600, 350, 1750, 2.0, 1000, 0.8, 0.88, 1.0]]
         },
         {
             "name": "Sunday Night Heat",
