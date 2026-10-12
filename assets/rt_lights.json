@@ -46,8 +46,20 @@
             "glows": [[0, 700, 2150, 2.0, 1300, 1.0, 0.2, 0.15], [-600, 350, 1750, 2.0, 1000, 0.8, 0.88, 1.0], [600, 350, 1750, 2.0, 1000, 0.8, 0.88, 1.0]]
         },
         {
+            // Sunday Night Heat: Raw's set and truss rig with the flaming HEAT titantron: warm white key and corner
+            // lamps, orange fire glow from the titantron, warm white tower lamps.
             "name": "Sunday Night Heat",
-            "match": ["2B54C38AA3632362", "E58D5C7BDC87D461"]
+            "match": ["2B54C38AA3632362", "E58D5C7BDC87D461"],
+            "lights": [[0, 1000, 0, 3], [-420, 950, -420, 1], [420, 950, -420, 1], [-420, 950, 420, 1], [420, 950, 420, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [1.0, 0.95, 0.86],
+            "outsideDarkness": 0.55,
+            "outsideEdge": 500,
+            "litAreas": [[0, 2100, 800, 500]],
+            "glows": [[0, 700, 2150, 2.4, 1300, 1.0, 0.38, 0.08], [-600, 350, 1750, 1.6, 1000, 1.0, 0.88, 0.7], [600, 350, 1750, 1.6, 1000, 1.0, 0.88, 0.7]]
         },
         {
             "name": "Royal Rumble",
