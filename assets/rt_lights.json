@@ -94,9 +94,21 @@
             "glows": [[0, 700, 2250, 2.4, 1300, 0.7, 0.6, 1.0], [-350, 120, 1850, 2.0, 800, 0.95, 0.95, 1.0], [350, 120, 1850, 2.0, 800, 0.95, 0.95, 1.0], [0, 350, 2400, 2.0, 1000, 0.3, 0.45, 1.0]]
         },
         {
+            // Survivor Series: darker arena (0.65), cool truss rig. The set is close (skull ~z 1400, braziers ~z 1250):
+            // flickering orange brazier fire on both sides, red from the skull's eyes, the blue floor pool.
             "name": "Survivor Series",
             "match": ["231180851438ED40", "93B48152E58E939B", "96817BF91FA3F612", "9409E8058DFF59BA", "390F42C0AB65BD4D",
-                      "A503BE495ED00809", "2FE3B061EF63C97A"]
+                      "A503BE495ED00809", "2FE3B061EF63C97A"],
+            "lights": [[0, 1000, 0, 3], [-420, 950, -420, 1], [420, 950, -420, 1], [-420, 950, 420, 1], [420, 950, 420, 1]],
+            "size": 30,
+            "radius": 650,
+            "shadow": 0.65,
+            "characterShadow": 0.4,
+            "color": [0.88, 0.92, 1.0],
+            "outsideDarkness": 0.65,
+            "outsideEdge": 450,
+            "litAreas": [[0, 1350, 700, 450]],
+            "glows": [[-330, 380, 1250, 3.0, 750, 1.0, 0.5, 0.12, 0.25], [330, 380, 1250, 3.0, 750, 1.0, 0.5, 0.12, 0.25], [0, 550, 1400, 1.6, 650, 1.0, 0.1, 0.05], [0, 150, 1150, 2.0, 800, 0.25, 0.4, 1.0]]
         },
         {
             "name": "WrestleMania",
