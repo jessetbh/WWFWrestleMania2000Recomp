@@ -1,0 +1,20 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "WWF WrestleMania 2000",
+  "project": "WWF WrestleMania 2000: Recompiled",
+  "system": "N64",
+  "type": "recomp",
+  "status": "released",
+  "targets": [
+    "Windows"
+  ],
+  "toolchain": [
+    "N64Recomp",
+    "RT64"
+  ],
+  "original": {
+    "region": "USA",
+    "revision": "V1.2",
+    "sha1": "d7d1fad473fef9b61fe5f8273c975ee7c603a51b"
+  }
+}
