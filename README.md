@@ -178,8 +178,6 @@ ROM** again.
 
 ## Known Issues
 
-* Multi-controller (2+ player) sessions are still being stabilized and can crash in
-  certain modes.
 * Overlays such as MSI Afterburner and other software such as Wallpaper Engine can
   cause performance issues that prevent the game from rendering correctly. Disabling
   such software is recommended.
