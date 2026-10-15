@@ -34,6 +34,7 @@ sharing their runtime stack and conventions.
   * [Easy-to-Use Menus](#easy-to-use-menus)
   * [Controls Tailored to This Game](#controls-tailored-to-this-game)
   * [Cart Saves, Controller Pak, and Rumble Together](#cart-saves-controller-pak-and-rumble-together)
+* [Compared with Emulation](#compared-with-emulation)
 * [Planned Features](#planned-features)
 * [FAQ](#faq)
 * [Known Issues](#known-issues)
@@ -128,6 +129,23 @@ your choice gives.
 The **Mods** menu (Settings → Mods) installs, configures and switches mods on and off. A free camera, cheats and a
 Quick Match testing tool come bundled; see [Mods and ROM Hacks](#mods-and-rom-hacks).
 
+## Compared with Emulation
+
+What the port takes care of that emulator setups for this game often need fiddling for:
+
+* **No plugins or emulator settings.** One renderer (RT64) is built in: there is nothing to pick, tune or swap
+  when something looks wrong.
+* **Widescreen, 60/120 fps and high resolution are built in**, not emulator-specific hacks.
+* **Saves are just files.** The cartridge save and the Controller Pak are written automatically to
+  `%LOCALAPPDATA%\Wm2kRecompiled\saves\` (or next to the exe in portable mode), with a backup copy. No save states or
+  pak images to manage.
+* **No pak swapping.** On the N64 the Controller Pak and the Rumble Pak share one slot. Here the cartridge save,
+  the Controller Pak and rumble all work at once (see [Cart Saves, Controller Pak, and Rumble Together](#cart-saves-controller-pak-and-rumble-together)).
+* **Controls set up for this game**, rebindable in the game's own menu, for keyboard and controllers, with rumble.
+* **ROM hacks without a special setup.** Many hacks run as patch mods on top of your clean ROM, switched on in
+  the Mods menu, instead of needing a particular emulator version, plugin and settings (see
+  [Mods and ROM Hacks](#mods-and-rom-hacks)).
+
 ## Planned Features
 
 * Linux support
@@ -163,6 +181,12 @@ level up in the same app folder. Save data is preserved across updates.
 Yes — place a file named `portable.txt` in the same folder as the executable and
 saves, config files, and the stored ROM will be kept next to the executable instead.
 
+#### Can I mod the game?
+
+Yes: the **Mods** menu (Settings → Mods) installs, configures and switches `.nrm` mods, and many ROM hacks run as
+patch mods. A free camera (F6), cheats and a Quick Match testing tool come bundled. See
+[Mods and ROM Hacks](#mods-and-rom-hacks).
+
 #### How do I choose a different ROM?
 
 **You don't.** This project is **only** a port of WWF WrestleMania 2000, and it only
@@ -183,6 +207,7 @@ ROM** again.
 * Overlays such as MSI Afterburner and other software such as Wallpaper Engine can
   cause performance issues that prevent the game from rendering correctly. Disabling
   such software is recommended.
+* The old **HDR Brightness** setting is replaced by **HDR Picture**; it starts on Auto.
 * Ray tracing, frame interpolation, the CRT filter and HDR are experimental. If something looks wrong,
   turn the feature off and please report it with your log file
   (`%LOCALAPPDATA%\Wm2kRecompiled\Wm2kRecompiled.log`).
