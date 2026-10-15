@@ -1,0 +1,73 @@
+# WM2000: 1P vs 2P Single Match from boot, both players mashing, then pads pulled/reconnected mid-match (hot-plug).
+# Run: AkiTools\aki-run.ps1 -Game wm2k -Worktree <wt> -Preset baseline -Seconds 200 -Vars @{ WCW_VPADS = '4'; WCW_VPADS_SCRIPT = '<path to this file>' }
+# Pass: the run ends with "recomp::start returned" and no crash; screenshots (-ShotSec) show the mode.
+0.00 1 a 500
+1.75 2 b 500
+2.00 1 a 500
+3.75 2 b 500
+4.00 1 a 500
+5.75 2 b 500
+6.00 1 a 500
+7.75 2 b 500
+8.00 1 a 500
+9.75 2 b 500
+10.00 1 a 500
+11.75 2 b 500
+12.00 1 a 500
+13.75 2 b 500
+14.00 1 a 500
+15.75 2 b 500
+16.00 1 a 500
+17.75 2 b 500
+18.00 1 a 500
+19.75 2 b 500
+20.00 1 a 500
+21.75 2 b 500
+22.00 1 a 500
+23.75 2 b 500
+24.00 1 a 500
+25.75 2 b 500
+26.00 1 a 500
+27.75 2 b 500
+28.00 1 a 500
+29.75 2 b 500
+32 1 start 200
+35 2 start 200
+38 1 a 200
+41 2 a 200
+# match: from 45 s, loop every 6 s
+45.00 1 dpright 300
+45.25 2 dpleft 300
+45.50 1 a 300
+45.75 2 b 300
+46.00 1 dpup 300
+46.25 2 dpdown 300
+46.50 1 b 300
+46.75 2 a 300
+47.00 1 dpleft 300
+47.25 2 dpright 300
+47.50 1 x 300
+47.75 2 y 300
+48.00 1 dpdown 300
+48.25 2 dpup 300
+48.50 1 a 300
+48.75 2 b 300
+49.25 2 x 300
+49.75 2 a 300
+50.00 1 y 300
+50.25 2 b 300
+50.50 1 a 300
+50.75 2 a 300
+45 repeat 6
+# hot-plug during the match
+0 plug 2
+75 unplug 2
+82 plug 2
+95 plug 3
+100 plug 4
+115 unplug 1
+121 plug 1
+130 unplug 2
+130.6 plug 2
+140 unplug 3
+141 unplug 4
