@@ -1,4 +1,4 @@
-# N64Recomp config for WWF WrestleMania 2000 (USA, V1.2). Adapted from Revenge's
+# N64Recomp config for WWF WrestleMania 2000 (USA, retail; aki-roadmap#124). Adapted from Revenge's
 # revenge.toml (which came from World Tour's wcw.toml). Same entrypoint 0x80000400.
 # FOUR overlays across two swap slots (see disasm/wm2k.yaml). Symbol-TOML mode.
 
