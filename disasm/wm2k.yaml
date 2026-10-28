@@ -1,4 +1,4 @@
-name: WWF WrestleMania 2000 (USA) (V1.2)
+name: WWF WrestleMania 2000 (USA)
 sha1: 442d417a52ed672ca1a47e7261a5414debb1e27a
 options:
   basename: wm2k
@@ -78,9 +78,8 @@ segments:
       # Non-code bytes in the range decode as junk functions that never execute (same
       # precedent as the ovl_c island).
       # - [0x3A1D8, asm]  # hack only (aki-roadmap#124): retail has no jumps here; data
-      # late code pocket: 11 j/jal targets from game code land in 0x3C0D0-0x3C628
-      # (found when func_80006668's `j 0x8003B628` tail call failed to recompile);
-      # asm continues through it, last jr $ra at 0x3C620.
+      # (the "late code pocket" 0x3C0D0-0x3C628 was the "V1.2" hack's code too: retail has no jumps
+      # into it and it stays data, like 0x3A1D8 above; aki-roadmap#124)
       - [0x3C628, data]
 
   # Swap slot 0x800E1B90: ovl_a (menus?) and ovl_d (match engine?) — ovl_d also

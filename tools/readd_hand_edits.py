@@ -94,11 +94,14 @@ def file_of(func_name):
     for fn in sorted(os.listdir(FUNCS)):
         if fn.endswith('.c') and sig in open(os.path.join(FUNCS, fn), 'rb').read().decode('utf-8', errors='replace'):
             return fn
-    return 'funcs_21.c'  # not found: body_range below reports it
+    return None
 
 # ---------------- funcs_21.c (or wherever func_800F53C8 lands) : music service trace ----------------
 def do_funcs_21():
     fn = file_of('func_800F53C8')
+    if fn is None:
+        failures.append('music trace: no generated file defines func_800F53C8')
+        return
     lines, _ = add_stdio(fn, 'for the music trace')
     add_header(lines, 'stdlib.h', 'getenv for the WCW_TRACE gate')
     if any('[wm2k][music]' in l for l in lines):
