@@ -190,9 +190,9 @@ patch mods. A free camera (F6), cheats and a Quick Match testing tool come bundl
 #### How do I choose a different ROM?
 
 **You don't.** This project is **only** a port of WWF WrestleMania 2000, and it only
-accepts one specific ROM: the USA **V1.2** release
-(SHA1 `D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B`). Earlier USA revisions (V1.0/V1.1)
-and other regions are **not** accepted. **It is not an emulator and it cannot run any
+accepts one specific ROM: the retail USA cartridge, "WWF WrestleMania 2000 (USA)"
+(SHA1 `442D417A52ED672CA1A47E7261A5414DEBB1E27A`). Modified ROMs (for example the patched file circulating as "V1.2", which is a fan
+hack) and other regions are **not** accepted. **It is not an emulator and it cannot run any
 arbitrary ROM.**
 
 You can't accidentally load the wrong file — the launcher validates the ROM before

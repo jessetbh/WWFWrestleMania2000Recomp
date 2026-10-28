@@ -31,8 +31,8 @@ body:
     id: romsha
     attributes:
       label: ROM SHA1
-      description: The only supported ROM is the USA V1.2 release, SHA1 D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B. You can compute yours in PowerShell with Get-FileHash -Algorithm SHA1 <rom>.
-      placeholder: D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B
+      description: The only supported ROM is the retail USA release, SHA1 442D417A52ED672CA1A47E7261A5414DEBB1E27A. You can compute yours in PowerShell with Get-FileHash -Algorithm SHA1 <rom>.
+      placeholder: 442D417A52ED672CA1A47E7261A5414DEBB1E27A
     validations:
       required: true
   - type: textarea

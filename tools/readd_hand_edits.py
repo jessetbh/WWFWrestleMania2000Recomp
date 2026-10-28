@@ -7,7 +7,7 @@ re-run). Run it AFTER tools/fix_stumps.py + tools/fix_switches.py:
 
   funcs_1.c  : [wm2k][trap]  invalid-music-id canary (fires only if the toml
                clamp patch at 0x80003DF0 is reached = slot corruption is back)
-  funcs_21.c : [wm2k][music] per-slot music service trace (func_800F53C8)
+  funcs_NN.c : [wm2k][music] per-slot music service trace (func_800F53C8)
   funcs_8.c  : [wm2k][sreg]  s-reg canary + repair after each dispatch call in
                func_800222D8's loop (sites after_4..after_10); sp drift log-only.
                ctx GPRs are 64-bit SIGN-EXTENDED: constants are 0xFFFFFFFF8xxx.
@@ -88,12 +88,24 @@ def do_funcs_1():
         save_lines('funcs_1.c', lines)
         print('funcs_1.c: trap canary re-added')
 
-# ---------------- funcs_21.c : music service trace ----------------
+def file_of(func_name):
+    """The generated file that defines func_name (file numbering shifts when the function set changes)."""
+    sig = 'RECOMP_FUNC void %s(' % func_name
+    for fn in sorted(os.listdir(FUNCS)):
+        if fn.endswith('.c') and sig in open(os.path.join(FUNCS, fn), 'rb').read().decode('utf-8', errors='replace'):
+            return fn
+    return None
+
+# ---------------- funcs_21.c (or wherever func_800F53C8 lands) : music service trace ----------------
 def do_funcs_21():
-    lines, _ = add_stdio('funcs_21.c', 'for the music trace')
+    fn = file_of('func_800F53C8')
+    if fn is None:
+        failures.append('music trace: no generated file defines func_800F53C8')
+        return
+    lines, _ = add_stdio(fn, 'for the music trace')
     add_header(lines, 'stdlib.h', 'getenv for the WCW_TRACE gate')
     if any('[wm2k][music]' in l for l in lines):
-        save_lines('funcs_21.c', lines); return
+        save_lines(fn, lines); return
     rng = body_range(lines, 'func_800F53C8')
     # after the s0 = base+stride*slot compute (0x800F5408's code line)
     lo, hi = rng
@@ -103,7 +115,7 @@ def do_funcs_21():
             idx = i + 1  # its code line
             break
     if idx is None:
-        failures.append('funcs_21: 0x800F5408 anchor missing')
+        failures.append('%s: 0x800F5408 anchor missing' % fn)
         return
     lines[idx + 1:idx + 1] = lf(
 '''    /* [wm2k diag] music-start tracing (hand-edit, dies on regen; opt-in WCW_TRACE=1 --
@@ -112,8 +124,8 @@ def do_funcs_21():
       if (wm2k_trace) fprintf(stderr, "[wm2k][music] f53C8 sp=0x%08X slot=%d s0=0x%08X cur2E6=%d nxt2E8=%d st2FC=0x%08X arg2FE=0x%04X\\n",
             (unsigned)ctx->r29, (int)(int16_t)ctx->r18, (unsigned)ctx->r16, (int)(int16_t)MEM_H(0X2E6, ctx->r16),
             (int)(int16_t)MEM_H(0X2E8, ctx->r16), (unsigned)MEM_W(0X2FC, ctx->r16), (unsigned)(uint16_t)MEM_HU(0X2FE, ctx->r16)); }''')
-    save_lines('funcs_21.c', lines)
-    print('funcs_21.c: music trace re-added')
+    save_lines(fn, lines)
+    print('%s: music trace re-added' % fn)
 
 # ---------------- funcs_8.c : s-reg canary + repair ----------------
 CANARY = '''    {{ /* [wm2k HAND-EDIT sreg canary] s0-s3 are loop invariants in func_800222D8
