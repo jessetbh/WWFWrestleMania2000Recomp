@@ -41,5 +41,5 @@ Thanks for your interest in improving WWF WrestleMania 2000: Recompiled!
 ## Reporting bugs
 
 Use the issue template. Always include your GPU + driver version, OS, the log output,
-and your ROM's SHA1 (the only supported ROM is the USA V1.2 release, SHA1
-`D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B`).
+and your ROM's SHA1 (the only supported ROM is the retail USA release, SHA1
+`442D417A52ED672CA1A47E7261A5414DEBB1E27A`).

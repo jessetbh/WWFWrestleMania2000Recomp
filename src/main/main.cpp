@@ -1007,7 +1007,7 @@ int main(int argc, char** argv) {
     wcw_ai_accurate_freq = true;
 
     recomp::GameEntry game{};
-    game.rom_hash = 0x72BBA9F8BC1E7A80ULL;          // XXH3_64bits of the NTSC-U V1.2 ROM
+    game.rom_hash = 0xBFAF05B6F8809F3DULL;          // XXH3_64bits of the retail USA ROM (SHA1 442D417A..., aki-roadmap#124)
     game.internal_name = "WRESTLEMANIA 2000";
     game.display_name = "WWF WrestleMania 2000";
     game.game_id = u8"wwf.wm2k.us";
