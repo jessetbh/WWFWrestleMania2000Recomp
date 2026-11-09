@@ -6,9 +6,9 @@
 ## Notes
 
 - **No game assets are included.** You must supply your own WWF WrestleMania 2000
-  (USA, V1.2) ROM — SHA1 `D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B`. On first
+  (USA) ROM — SHA1 `442D417A52ED672CA1A47E7261A5414DEBB1E27A`. On first
   launch, click **Load ROM** and select it; the launcher validates and remembers
-  it. Earlier USA revisions (V1.0/V1.1) and other regions are not accepted.
+  it. Modified ROMs (such as the "V1.2" fan hack) and other regions are not accepted.
 - **Windows SmartScreen**: the exe is unsigned, so Windows may warn on first run.
   Click "More info" → "Run anyway".
 - **Saves and settings** live in `%LOCALAPPDATA%\Wm2kRecompiled\` — both the cart

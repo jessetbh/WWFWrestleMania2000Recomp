@@ -54,9 +54,9 @@ git config --global core.longpaths true
 
 ## 3. Provide the ROM
 
-Place the **WWF WrestleMania 2000 (USA, V1.2)** ROM as `wm2k.z64` in the repo
-root — SHA1 `D7D1FAD473FEF9B61FE5F8273C975EE7C603A51B`, big-endian. Earlier USA
-revisions (V1.0/V1.1) and other regions will not work. It is used only by the
+Place the retail **WWF WrestleMania 2000 (USA)** ROM as `wm2k.z64` in the repo
+root — SHA1 `442D417A52ED672CA1A47E7261A5414DEBB1E27A`, big-endian. Modified ROMs (the "V1.2" file is a fan hack)
+and other regions will not work. It is used only by the
 recompiler steps below; at runtime the launcher asks for (and remembers) a ROM
 on first start. The code is not compressed, so there is no decompression step.
 
